@@ -72,6 +72,7 @@ export function createSignalingServer(options = {}) {
 
   function handleRegister(ws, msg) {
     if (authToken && msg.token !== authToken) {
+      logFn('[register rejected] bad_token', peer);
       safeSend(ws, { type: 'error', code: 'bad_token', message: 'invalid auth token' });
       return;
     }
@@ -81,6 +82,7 @@ export function createSignalingServer(options = {}) {
 
     const existing = devices.get(id);
     if (existing && existing.ws !== ws && existing.ws.readyState === WebSocket.OPEN) {
+      logFn('[register rejected] id_taken', id, peer);
       safeSend(ws, { type: 'error', code: 'id_taken', message: `device id "${id}" already online` });
       return;
     }
@@ -99,6 +101,10 @@ export function createSignalingServer(options = {}) {
   wss.on('connection', (ws) => {
     ws.deviceId = null;
     ws.isAlive = true;
+    // 每个到达的 TCP 都记一行，注册与否都记。"一台机器根本没连上"和"连上了但
+    // 注册被拒"是两种完全不同的故障，在补这行之前它们在日志里长得一模一样。
+    const peer = `${ws._socket?.remoteAddress || '?'}:${ws._socket?.remotePort || '?'}`;
+    logFn('[conn]', peer);
     ws.on('pong', () => {
       ws.isAlive = true;
     });
@@ -117,6 +123,8 @@ export function createSignalingServer(options = {}) {
       }
 
       const type = msg.type;
+      logFn('[msg]', type, 'from', ws.deviceId || '(unregistered)', peer,
+        msg.to ? `to=${msg.to}` : '');
 
       if (type === 'register') {
         handleRegister(ws, msg);
@@ -215,7 +223,10 @@ export function createSignalingServer(options = {}) {
     });
 
     ws.on('close', () => {
-      if (!ws.deviceId) return;
+      if (!ws.deviceId) {
+        logFn('[gone]', peer, '(never registered)');
+        return;
+      }
       const entry = devices.get(ws.deviceId);
       if (entry && entry.ws === ws) {
         devices.delete(ws.deviceId);
