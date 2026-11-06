@@ -26,23 +26,53 @@ if [ ! -x /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild ]; then
   exit 1
 fi
 
-export PUB_HOSTED_URL="${PUB_HOSTED_URL:-https://pub.flutter-io.cn}"
-export FLUTTER_STORAGE_BASE_URL="${FLUTTER_STORAGE_BASE_URL:-https://storage.flutter-io.cn}"
+# 以前这里无条件把 PUB_HOSTED_URL 默认成国内镜像。代价是会被写进 pubspec.lock：
+# 每个包的 description.url 从 https://pub.dev 变成 https://pub.flutter-io.cn，
+# 于是 65 个依赖全部"changed"——版本一个没变，只是 host 变了。这一改动会顺带
+# 把 Pods 判成过期，逼 Flutter 去跑 pod install，而本机没装 CocoaPods，构建直接
+# 以「CocoaPods not installed or not in valid state.」失败。所以只在外部显式要求
+# 时才用镜像，不要替用户改 lock。
+if [ -n "${PUB_HOSTED_URL:-}" ]; then
+  export FLUTTER_STORAGE_BASE_URL="${FLUTTER_STORAGE_BASE_URL:-https://storage.flutter-io.cn}"
+  echo "==> 使用镜像源：$PUB_HOSTED_URL"
+fi
 
 MODE="${1:-release}"   # release | debug | run
 
 cd "$APP_DIR"
 
-echo "==> flutter pub get"
-flutter pub get
+# Flutter 用 Podfile.lock 与 Pods/Manifest.lock 是否逐字节相同来决定要不要跑
+# pod install。这台机器没装 CocoaPods，一旦它决定要跑，构建就必然失败。Pods 目录
+# 本身是按这份 lock 装好的，所以补一份同样的 Manifest.lock 即可——这不是掩盖问题，
+# 而是把 CocoaPods 自己会写的那份文件补回去。
+if [ -f macos/Podfile.lock ] && [ ! -f macos/Pods/Manifest.lock ]; then
+  echo "==> 补 macos/Pods/Manifest.lock（本机无 CocoaPods，Pods 已按 Podfile.lock 装好）"
+  cp macos/Podfile.lock macos/Pods/Manifest.lock
+fi
+
+# 依赖没动就别跑 pub get：它会把 lock 里的 host 改写一遍，白改还可能踩上面那个坑。
+# 判据用内容指纹而不是 mtime——`git checkout` 会把文件时间刷成当前时间，
+# 按时间比会误判成"依赖变了"。
+PACKAGE_CONFIG=".dart_tool/package_config.json"
+STAMP=".dart_tool/pub-inputs.sha"
+CURRENT="$(shasum -a 256 pubspec.yaml pubspec.lock | shasum -a 256 | cut -d' ' -f1)"
+PUB_FLAG=()
+if [ -f "$PACKAGE_CONFIG" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$CURRENT" ]; then
+  PUB_FLAG+=(--no-pub)
+  echo "==> 依赖未变动（指纹 ${CURRENT}），跳过 pub get"
+else
+  echo "==> flutter pub get"
+  flutter pub get
+  printf '%s\n' "$CURRENT" > "$STAMP"
+fi
 
 if [ "$MODE" = "run" ]; then
   echo "==> flutter run -d macos（热重载模式，Ctrl+C 退出）"
-  exec flutter run -d macos
+  exec flutter run -d macos "${PUB_FLAG[@]}"
 fi
 
 echo "==> flutter build macos --$MODE"
-flutter build macos "--$MODE"
+flutter build macos "--$MODE" "${PUB_FLAG[@]}"
 
 BUNDLE="$APP_DIR/build/macos/Build/Products/$([ "$MODE" = "debug" ] && echo Debug || echo Release)/remotedesk.app"
 if [ ! -d "$BUNDLE" ]; then

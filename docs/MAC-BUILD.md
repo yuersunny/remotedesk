@@ -109,3 +109,25 @@ python3 -m http.server 8080 --bind 127.0.0.1
 
 原生版相对网页版的优势要到 M2 才明显：输入注入需要 `CGEvent`，
 网页版做不到对系统级鼠标键盘的注入。
+
+---
+
+## 两个会直接卡住构建的坑（已由 `build-macos.sh` 兜住）
+
+**1. 别让 `PUB_HOSTED_URL` 把镜像地址写进 `pubspec.lock`。**
+以前脚本无条件把 `PUB_HOSTED_URL` 默认成 `https://pub.flutter-io.cn`，于是每个包
+`description.url` 从 `https://pub.dev` 变成镜像地址，`flutter pub get` 报
+**"Changed 65 dependencies!"**——版本一个没动，只是 host 换了。连带后果是 Pods 被判定
+过期，Flutter 要去跑 `pod install`，而这台机器没有 CocoaPods，构建就以
+`CocoaPods not installed or not in valid state.` 结束。
+现在脚本只在外部**显式**设置了 `PUB_HOSTED_URL` 时才用镜像。
+
+**2. 本机没有 CocoaPods，`Pods/Manifest.lock` 必须存在且与 `Podfile.lock` 逐字节相同。**
+Flutter 用这两个文件的内容比对来决定要不要跑 `pod install`（不是比 mtime）。
+`Pods/` 里其实已经按 `Podfile.lock` 装好了所有 pod，只差这一份清单文件。
+脚本会在缺失时把 `Podfile.lock` 复制成 `Pods/Manifest.lock`——
+补的是 CocoaPods 自己本该写的那份，不是绕过检查。
+
+**顺带一条**：依赖没变时脚本走 `--no-pub`，判据是 `pubspec.yaml` + `pubspec.lock`
+的**内容指纹**（存于 `.dart_tool/pub-inputs.sha`），不是文件时间——
+`git checkout` 会把 mtime 刷成当前时间，按时间比会误判成"依赖变了"。

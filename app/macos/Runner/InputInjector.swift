@@ -60,6 +60,15 @@ enum MacInputInjector {
     // looked at; also the first place to check for a missing grant.
     log("input channel registered (trusted=\(trusted ? 1 : 0), "
         + "bundle=\(Bundle.main.bundlePath), pid=\(ProcessInfo.processInfo.processIdentifier))")
+    startAuditTimer()
+    // Logged once. If the "four corners" item fails, this line decides whether
+    // the geometry is wrong or the controller never sent what it claims.
+    let union = displayUnion()
+    let far = point(x: 1, y: 1)
+    log("geometry displays=\(activeDisplayIDs().count) "
+        + "union=\(Int(union.minX)),\(Int(union.minY)) "
+        + "\(Int(union.width))x\(Int(union.height)) "
+        + "corner1,1=\(Int(far.x)),\(Int(far.y))")
   }
 
   // MARK: - Diagnostics
@@ -94,6 +103,95 @@ enum MacInputInjector {
     } else {
       try? data.write(to: url, options: .atomic)
     }
+  }
+
+  // MARK: - Audit
+  //
+  // One compact line per ~5 s of remote activity, in the same log file.
+  //
+  // "The mouse felt fine" is not evidence. Every checklist item that can be
+  // proven from counters is: which buttons actually arrived, whether moves
+  // landed as drags while one was held, whether a second press was declared as
+  // `clickState` 2, which modifier bitmasks showed up, and how far the wheel
+  // travelled in each direction. Without this, a failure looks identical to a
+  // vague impression, and a working injector is argued about instead of checked.
+  //
+  // Only wire ids and raw flag bitmasks are recorded — never characters, never
+  // text. A diagnostic log has no business becoming a keylogger.
+
+  private struct Audit {
+    var pointerMoves = 0
+    var drags = 0
+    var normMinX = Double.infinity
+    var normMinY = Double.infinity
+    var normMaxX = -Double.infinity
+    var normMaxY = -Double.infinity
+    var lastGlobal = CGPoint.zero
+    var buttonDown: [Int: Int] = [:]
+    var buttonUp: [Int: Int] = [:]
+    var maxClickState = 0
+    var wheelCount = 0
+    var wheelDyMin = Int.max
+    var wheelDyMax = Int.min
+    var keyCount = 0
+    var keyTrace: [String] = []
+    var flagsSeen: UInt64 = 0
+    var dirty = false
+
+    mutating func noteNorm(_ x: Double, _ y: Double) {
+      normMinX = min(normMinX, x)
+      normMinY = min(normMinY, y)
+      normMaxX = max(normMaxX, x)
+      normMaxY = max(normMaxY, y)
+    }
+
+    func summary() -> String {
+      func pt(_ x: Double, _ y: Double) -> String {
+        guard x.isFinite, y.isFinite else { return "-" }
+        return String(format: "%.3f,%.3f", x, y)
+      }
+      let names = ["L", "M", "R"]
+      let buttons = (0..<3).map { wire in
+        "\(names[wire])\(buttonDown[wire] ?? 0)/\(buttonUp[wire] ?? 0)"
+      }.joined(separator: " ")
+      let wheel = wheelDyMin == Int.max ? "-" : "\(wheelDyMin)..\(wheelDyMax)"
+      // Left unflushed state shows up as a missing line, so the "dirty" flag is
+      // carried in the struct rather than beside it.
+      return "ptr=\(pointerMoves) drag=\(drags) "
+        + "norm=\(pt(normMinX, normMinY))..\(pt(normMaxX, normMaxY)) "
+        + "at=\(Int(lastGlobal.x)),\(Int(lastGlobal.y)) "
+        + "btn=[\(buttons)] click=\(maxClickState) "
+        + "wheel=\(wheelCount) dy=\(wheel) "
+        + "key=\(keyCount) seq=\(keyTrace.joined(separator: " ")) "
+        + "flags=0x\(String(flagsSeen, radix: 16))"
+    }
+  }
+
+  private static var audit = Audit()
+  private static var auditTimer: DispatchSourceTimer?
+
+  private static func auditNote(_ mutate: (inout Audit) -> Void) {
+    mutate(&audit)
+    audit.dirty = true
+  }
+
+  /// Flushes on a timer as well as inline. A single click followed by silence
+  /// would otherwise never reach the file — which is exactly the case someone
+  /// tests right before asking whether it worked.
+  private static func startAuditTimer() {
+    guard auditTimer == nil else { return }
+    let timer = DispatchSource.makeTimerSource(queue: .main)
+    timer.schedule(deadline: .now() + 5, repeating: 5)
+    timer.setEventHandler { flushAudit() }
+    timer.resume()
+    auditTimer = timer
+  }
+
+  private static func flushAudit() {
+    guard audit.dirty else { return }
+    let taken = audit
+    audit = Audit()
+    log("audit \(taken.summary())")
   }
 
   // MARK: - Permission
@@ -228,7 +326,13 @@ enum MacInputInjector {
       return
     }
     let action = int(args["action"])
-    let target = point(x: double(args["x"]), y: double(args["y"]))
+    let nx = double(args["x"])
+    let ny = double(args["y"])
+    let target = point(x: nx, y: ny)
+    auditNote { a in
+      a.noteNorm(nx, ny)
+      a.lastGlobal = target
+    }
 
     if action == 0 {
       moveCursor(to: target)
@@ -244,6 +348,14 @@ enum MacInputInjector {
       moveCursor(to: target)
     }
     postButton(wire: wire, pressed: pressed, at: target)
+    auditNote { a in
+      if pressed {
+        a.buttonDown[wire, default: 0] += 1
+      } else {
+        a.buttonUp[wire, default: 0] += 1
+      }
+      a.maxClickState = max(a.maxClickState, clickState)
+    }
     result(nil)
   }
 
@@ -266,6 +378,14 @@ enum MacInputInjector {
     }
     post(CGEvent(mouseEventSource: source, mouseType: type,
                  mouseCursorPosition: target, mouseButton: button))
+    auditNote { a in
+      a.pointerMoves += 1
+      a.lastGlobal = target
+      // Counted here, not at the call site: this is the single place that
+      // decides hover-vs-drag, so the counter cannot drift from the behaviour
+      // it claims to describe.
+      if pressedWireButton != nil { a.drags += 1 }
+    }
   }
 
   private static func postButton(wire: Int, pressed: Bool, at target: CGPoint) {
@@ -321,6 +441,11 @@ enum MacInputInjector {
     let pixelsPerDelta = 0.5
     let dy = Int32((double(args["dy"]) * pixelsPerDelta).rounded())
     let dx = Int32((double(args["dx"]) * pixelsPerDelta).rounded())
+    auditNote { a in
+      a.wheelCount += 1
+      a.wheelDyMin = min(a.wheelDyMin, Int(dy))
+      a.wheelDyMax = max(a.wheelDyMax, Int(dy))
+    }
     if dx == 0 && dy == 0 {
       result(nil)
       return
@@ -374,6 +499,15 @@ enum MacInputInjector {
     }
     event.flags = currentFlags()
     post(event)
+    let flags = event.flags.rawValue
+    auditNote { a in
+      a.keyCount += 1
+      // Wire id, direction and the flag word only: enough to prove that
+      // Right-Option carried NX_DEVICERALTKEYMASK and that Cmd+C had
+      // maskCommand set, without recording what was typed.
+      if a.keyTrace.count < 12 { a.keyTrace.append("\(wire)\(down ? "d" : "u")") }
+      a.flagsSeen |= flags
+    }
   }
 
   private static func currentFlags() -> CGEventFlags {
