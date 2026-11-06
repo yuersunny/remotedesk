@@ -135,6 +135,37 @@ Windows 套件用它重新打包（会把当前源码快照进包，并跑一遍
 ./scripts/pack-windows-kit.sh m2.2   # → dist/remotedesk-windows-kit-m2.2.zip
 ```
 
+### 出可执行程序（给没装开发工具链的机器）
+
+上面那个 kit 是**开发套件**：源码 + 构建脚本，目标机还得装 Visual Studio 和 Flutter。
+要交给一台干净机器直接用的，用下面两个：
+
+```bash
+./scripts/pack-macos-dmg.sh 1.0.0                                # → dist/RemoteDesk-1.0.0-macos-universal.dmg
+./scripts/pack-windows-portable.sh <Release目录 或 回传的kit.zip>  # → dist/RemoteDesk-Windows.zip
+```
+
+| | macOS | Windows |
+|---|---|---|
+| 形态 | dmg，拖进 Applications | zip，解压即用，不写注册表 |
+| 架构 | Universal（Intel + Apple Silicon） | x64 |
+| 体积 | 34 MB（app 73 MB） | 45 MB（解压 72 MB） |
+| 前提 | macOS 12+ | Win10 1809+ |
+| 兜底 | 镜像内含清隔离标记的 `.command` | 内含 `vc_redist.x64.exe`（缺运行库时用） |
+
+两边的说明文件都随包，讲清了权限、`/ws` 后缀、设备 ID 不能重复这些必踩的坑。
+
+两根编码红线（踩过，会静默出错）：
+- `START.cmd` 必须**无 BOM + CRLF + 纯 ASCII**。带 BOM 时 cmd.exe 把 BOM 当命令，
+  首行报 `'ï»¿@echo' 不是内部或外部命令`；LF 行尾会让 `goto` 定位失败。
+- macOS 的 `.command` 反过来**绝不能有 BOM**，否则 shebang 失效、双击无反应。
+  另外 `.command` 里也不要用 `$VAR` 紧跟中文标点——bash 会把全角字节吞进变量名，
+  报 `unbound variable`，所以一律写 `${VAR}`。
+
+Windows 那份必须在 Windows 上编译（本机没有 MSVC），
+把 `app/build/windows/x64/runner/Release` 目录、或整个回传的 kit zip 传进来即可。
+脚本会自己从 zip 里找 `runner/Release`，不依赖固定层级。
+
 ## 跨机器（Mac ↔ Windows）
 
 两台机器各在自己机器上打开网页（**必须 localhost**），只把信令指向对方 IP：

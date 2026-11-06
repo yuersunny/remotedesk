@@ -31,6 +31,7 @@ app/macos/.symlinks/
 #                    新克隆的仓库要重新放一份，否则 00-RUN-WEB-NOW.cmd 只能退回
 #                    系统 node（或 winget install OpenJS.NodeJS.LTS）。
 dist/*.zip
+dist/*.dmg
 dist/windows-kit/src/
 dist/windows-kit/web-preview/
 dist/windows-kit/node/
