@@ -199,7 +199,10 @@ class RtcSession {
     };
 
     if (_localStream != null) {
-      await _attachTracks(pc, _localStream!);
+      // 预览可以立刻挂上，但 **addTrack 不能在这里**：此刻还没有
+      // setRemoteDescription，新建的 transceiver 与 offer 里那条 m-line 对不上，
+      // 只能靠再协商一轮去合并，而这条链路没有重协商 —— 结果就是数据通道通、
+      // 画面永远不来。推流交给 handleOffer，那时 offer 的 m-line 已经就位。
       localRenderer.srcObject = _localStream;
     }
 
@@ -283,7 +286,38 @@ class RtcSession {
         '（画面 $videoWidth×$videoHeight）');
   }
 
+  /// Controller side only: reserve the receive-side video m-line.
+  ///
+  /// In unified-plan, `offerToReceiveVideo` is a Plan-B option and does **not**
+  /// create an m-line. The controller captures nothing, so without this an
+  /// offer carries the data channel and nothing else. The target's `addTrack`
+  /// would then have to create its own transceiver, which needs a second
+  /// negotiation round this pipeline never performs — the observable symptom
+  /// is exactly "pointer works, no picture".
+  Future<void> _ensureVideoReceiver(RTCPeerConnection pc) async {
+    if (_videoReceiverAdded) return;
+    _videoReceiverAdded = true;
+    try {
+      await pc.addTransceiver(
+        kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
+        init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
+      );
+      _log('已预置接收侧视频 transceiver');
+    } catch (e) {
+      // Older platform implementations may lack transceiver support. Failing
+      // here must not cost us the session: fall back to the old behaviour and
+      // let the negotiation succeed or fail on its own merits.
+      _videoReceiverAdded = false;
+      _log('预置视频 transceiver 失败（将回退）: $e');
+    }
+  }
+
+  bool _videoReceiverAdded = false;
+  bool _tracksAttached = false;
+
   Future<void> _attachTracks(RTCPeerConnection pc, MediaStream stream) async {
+    if (_tracksAttached) return;
+    _tracksAttached = true;
     for (final track in stream.getVideoTracks()) {
       await pc.addTrack(track, stream);
     }
@@ -294,7 +328,20 @@ class RtcSession {
     _localStream = stream;
     localRenderer.srcObject = stream;
     final pc = _pc;
-    if (pc != null) await _attachTracks(pc, stream);
+    if (pc == null) return;
+    if (_remoteDescriptionSet) {
+      // Same rule as [start]: only attach once the remote description is in, so
+      // the track lands on the offer's m-line instead of a fresh transceiver.
+      await _attachTracks(pc, stream);
+      return;
+    }
+    // An offer arrived while we were still capturing — it was parked because
+    // there was nothing to send. Answer it now.
+    final pending = _pendingOffer;
+    if (pending != null) {
+      _pendingOffer = null;
+      await handleOffer(pending);
+    }
   }
 
   /// Controller side: make the offer and send it.
@@ -302,6 +349,7 @@ class RtcSession {
     final pc = _pc;
     if (pc == null || _disposed) return;
     await ensureInputChannel();
+    await _ensureVideoReceiver(pc);
     final offer = await pc.createOffer(<String, dynamic>{
       'offerToReceiveVideo': true,
       'offerToReceiveAudio': false,
@@ -358,6 +406,12 @@ class RtcSession {
     );
     _remoteDescriptionSet = true;
     await _flushCandidates();
+
+    // Now — and only now — attach the captured track. The offer's recvonly
+    // m-line exists at this point, so addTrack reuses it and the answer turns
+    // it into sendonly in the same round.
+    final stream = _localStream;
+    if (stream != null) await _attachTracks(pc, stream);
 
     final answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);

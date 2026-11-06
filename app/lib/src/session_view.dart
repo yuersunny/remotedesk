@@ -46,7 +46,7 @@ class SessionView extends StatefulWidget {
   State<SessionView> createState() => _SessionViewState();
 }
 
-class _SessionViewState extends State<SessionView> {
+class _SessionViewState extends State<SessionView> with WidgetsBindingObserver {
   /// Keys we have told the target are down. Released on focus loss so the
   /// remote desktop cannot be left with a stuck modifier — a confusing failure
   /// mode where every later key arrives as Ctrl+X.
@@ -70,7 +70,32 @@ class _SessionViewState extends State<SessionView> {
       widget.phase == SessionPhase.live;
 
   @override
+  void initState() {
+    super.initState();
+    // Keyboard goes through a process-wide handler rather than
+    // `Focus.onKeyEvent`: the Focus-based path only fires while that exact node
+    // holds focus, and any click on another control (the address field, a
+    // dialog) silently takes it away for good — the pointer keeps working
+    // because it travels through `Listener`, which needs no focus, so the
+    // failure looks like "mouse works, keyboard dead". A global handler sees
+    // every key the window receives, wherever focus sits.
+    HardwareKeyboard.instance.addHandler(_onGlobalKey);
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  /// Release everything the remote machine thinks is held when this window
+  /// stops being the active one. Without it a window switch mid-keystroke
+  /// leaves a modifier stuck down remotely, and every later key arrives as
+  /// Ctrl+X.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) _releaseAll();
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    HardwareKeyboard.instance.removeHandler(_onGlobalKey);
     _releaseAll();
     _focusNode.dispose();
     super.dispose();
@@ -224,10 +249,10 @@ class _SessionViewState extends State<SessionView> {
         return Focus(
           focusNode: _focusNode,
           autofocus: true,
-          onKeyEvent: _onKeyEvent,
-          onFocusChange: (hasFocus) {
-            if (!hasFocus) _releaseAll();
-          },
+          // No `onKeyEvent` here: keys are handled process-wide in
+          // [_onGlobalKey]. Releasing on focus loss moved to the lifecycle
+          // observer, because losing widget focus no longer means the user
+          // stopped typing at the remote machine.
           child: Listener(
             onPointerHover: (event) => _sendMove(fit, event.localPosition),
             onPointerMove: (event) => _sendMove(
@@ -360,31 +385,34 @@ class _SessionViewState extends State<SessionView> {
     ));
   }
 
-  KeyEventResult _onKeyEvent(FocusNode node, KeyEvent event) {
-    if (!_canControl) return KeyEventResult.ignored;
+  /// Process-wide key handler. Returns true when the event was consumed, which
+  /// stops it from also being delivered to local widgets — desirable here, as
+  /// the key is meant for the remote machine.
+  bool _onGlobalKey(KeyEvent event) {
+    if (!_canControl) return false;
 
     // Physical keys, not logical ones: the target must receive the key that was
     // pressed, regardless of the controller's layout or IME state.
     final key = proto.InputKey.fromHidUsage(event.physicalKey.usbHidUsage);
-    if (key == null) return KeyEventResult.ignored;
+    if (key == null) return false;
 
     if (event is KeyDownEvent) {
       _pressedKeys.add(key);
       widget.session.input.send(
         proto.KeyEvent(key: key, pressed: true, modifiers: _modifiers()),
       );
-      return KeyEventResult.handled;
+      return true;
     }
     if (event is KeyUpEvent) {
       _pressedKeys.remove(key);
       widget.session.input.send(
         proto.KeyEvent(key: key, pressed: false, modifiers: _modifiers()),
       );
-      return KeyEventResult.handled;
+      return true;
     }
     // KeyRepeatEvent: the target's own OS generates repeats for a held key, so
     // forwarding these would roughly double the repeat rate.
-    return KeyEventResult.ignored;
+    return false;
   }
 
   /// Current modifier state, sampled per event rather than tracked: the OS is
@@ -411,33 +439,118 @@ class _SessionViewState extends State<SessionView> {
     return mask;
   }
 
+  /// Target side: deliberately **no** local preview.
+  ///
+  /// Mirroring the captured desktop back onto the machine being captured makes
+  /// a picture-in-picture loop: the window shows the screen, that screen
+  /// contains the window, and a click on the inner copy sends the remote cursor
+  /// chasing smaller copies of itself. Nothing about being controlled requires
+  /// the picture. What the person sitting at this machine actually needs is who
+  /// is connected, whether the stream is healthy, and how to stop it.
   Widget _localArea(ThemeData theme) {
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        RTCVideoView(
-          widget.session.localRenderer,
-          objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
-        ),
-        Positioned(
-          left: 12,
-          top: 12,
-          child: _chip(
-            icon: Icons.fiber_manual_record,
-            label: '正在共享本机屏幕',
-            color: const Color(0xFFFF6B6B),
-            iconSize: 10,
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 460),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Center(
+                child: Container(
+                  width: 64,
+                  height: 64,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFF6B6B).withValues(alpha: 0.12),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(
+                    Icons.screen_share_outlined,
+                    color: Color(0xFFFF6B6B),
+                    size: 28,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 18),
+              const Center(
+                child: Text(
+                  '正在共享本机屏幕',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Center(
+                child: Text(
+                  '主控设备 · ${widget.session.peerId}',
+                  style: const TextStyle(color: Colors.white54, fontSize: 13),
+                ),
+              ),
+              const SizedBox(height: 26),
+              Row(
+                children: [
+                  _stat('分辨率', widget.stats.resolution),
+                  _stat('帧率', widget.stats.fpsText),
+                  _stat('码率', widget.stats.kbpsText),
+                ],
+              ),
+              const SizedBox(height: 26),
+              _hintRow(
+                Icons.visibility_off_outlined,
+                '这里不显示画面',
+                '把自己映给自己是无限套娃，被控端不需要看画面。',
+              ),
+              const SizedBox(height: 10),
+              _hintRow(
+                Icons.push_pin_outlined,
+                '可以最小化，别关闭',
+                '关掉这个窗口等于结束共享，对面会立刻失去画面。',
+              ),
+            ],
           ),
         ),
-        Positioned(
-          left: 12,
-          bottom: 12,
-          child: Text(
-            '主控端: ${widget.session.peerId}',
-            style: const TextStyle(color: Colors.white38, fontSize: 12),
+      ),
+    );
+  }
+
+  Widget _hintRow(IconData icon, String title, String body) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.04),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 16, color: Colors.white38),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  body,
+                  style: const TextStyle(color: Colors.white38, fontSize: 11.5, height: 1.45),
+                ),
+              ],
+            ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 

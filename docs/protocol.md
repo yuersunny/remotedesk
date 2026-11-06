@@ -18,7 +18,7 @@
 | C→S | `list` | — | 查询在线设备 |
 | S→C | `devices` | `devices:[{id,name}]` | 在线设备列表（不含自己） |
 | C→S | `connect` | `to`, `password?` | 请求连接目标 |
-| S→target | `incoming` | `from`, `fromName`, `requiresPassword` | 通知被控端有来电 |
+| S→target | `incoming` | `from`, `fromName`, `requiresPassword`, `password` | 通知被控端有来电；口令原样带上，由被控端自行比对 |
 | S→C | `connect_requested` | `to` | 已转发请求 |
 | C→S | `accept` | `to`, `password?` | 被控端接受（可附带会话密码） |
 | S→C | `accepted` | `from`, `password?` | 主控端收到接受 |
@@ -48,6 +48,7 @@
 | `no_target` | 缺少 `to` 字段 |
 | `target_offline` | 目标不在线 |
 | `unknown_type` | 未知消息类型 |
+| `rate_limited` | 同一调用方的 `connect` 超过 10 次/分钟（防口令爆破），`message` 给出建议等待秒数 |
 
 ## 会话建立时序
 
@@ -66,6 +67,27 @@
 ```
 
 信令服务器只做**转发**，不解析 SDP，不接触媒体内容。媒体走后建立好的 WebRTC 通道（P2P 直连或经 coturn 中继），端到端由 WebRTC 的 DTLS-SRTP 加密。
+
+## 无人值守（没人点确认的连接）
+
+被控端可以打开无人值守：来电不再弹确认框，改为**比对口令后自动接受**。
+
+```
+主控A                            信令                      被控B（无人值守）
+  |-- connect(to=B, password) --->|-- incoming({password}) -->|
+  |                               |        B 比对本地口令       |
+  |<-- accepted(from=B) ----------|<-- accept(to=A) ----------|   匹配
+  |<-- rejected(from=B) ----------|<-- reject(to=A) ----------|   不匹配
+```
+
+| 约定 | 取值 | 原因 |
+|---|---|---|
+| 谁持有口令 | **只有被控端** | 服务端只转发、不保存也不校验，泄露面最小 |
+| 口令长度下限 | 6 位 | 短于这个长度时拒绝开启无人值守 |
+| 尝试限制 | 同一调用方 10 次/60 秒 | 自动接受意味着没有人能拦住第 N 次猜测，只能由服务端限速 |
+| 口令传输 | 随 `connect` 明文走 WebSocket | 所以跨公网必须 `wss://` 或 Tailscale 这类私有网络，否则口令与画面一起裸奔 |
+
+开了无人值守但没设口令时，被控端会**拒绝所有来电**而不是放行 —— 配置残缺时的默认值必须是"关"，不能是"开"。
 
 ## M1 实现约定（画面单向传输）
 

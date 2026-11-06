@@ -44,6 +44,45 @@ export function createSignalingServer(options = {}) {
   /** @type {Map<string, {ws: WebSocket, name: string, lastSeen: number, meta: object}>} */
   const devices = new Map();
 
+  /**
+   * Connect attempts per caller, so a wrong password cannot be brute-forced by
+   * simply calling again. Unattended targets accept automatically, which makes
+   * the caller-side attempt rate the only thing standing between the password
+   * and the machine — the server is the right place to bound it, because the
+   * caller cannot forget to apply it.
+   *
+   * @type {Map<string, {count: number, resetAt: number}>}
+   */
+  const callAttempts = new Map();
+  const CALL_WINDOW_MS = 60_000;
+  const CALL_MAX_PER_WINDOW = 10;
+
+  function checkCallBudget(callerId) {
+    const now = Date.now();
+    const entry = callAttempts.get(callerId);
+    if (!entry || now >= entry.resetAt) {
+      callAttempts.set(callerId, { count: 1, resetAt: now + CALL_WINDOW_MS });
+      return { ok: true };
+    }
+    if (entry.count >= CALL_MAX_PER_WINDOW) {
+      return {
+        ok: false,
+        retryAfter: Math.ceil((entry.resetAt - now) / 1000),
+      };
+    }
+    entry.count += 1;
+    return { ok: true };
+  }
+
+  // Attempt counters are only useful while they are bounded.
+  const attemptSweeper = setInterval(() => {
+    const now = Date.now();
+    for (const [id, entry] of callAttempts) {
+      if (now >= entry.resetAt) callAttempts.delete(id);
+    }
+  }, 60_000);
+  if (attemptSweeper.unref) attemptSweeper.unref();
+
   const httpServer = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/health') {
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
@@ -156,16 +195,31 @@ export function createSignalingServer(options = {}) {
             safeSend(ws, { type: 'error', code: 'no_target' });
             return;
           }
+          const budget = checkCallBudget(ws.deviceId || 'anonymous');
+          if (!budget.ok) {
+            logFn(`[connect throttled] ${ws.deviceId} -> ${to} retry=${budget.retryAfter}s`);
+            safeSend(ws, {
+              type: 'error',
+              code: 'rate_limited',
+              message: `尝试过于频繁，请 ${budget.retryAfter} 秒后重试`,
+            });
+            return;
+          }
           const target = devices.get(to);
           if (!target) {
             safeSend(ws, { type: 'error', code: 'target_offline', to });
             return;
           }
+          // The password travels with the request: an unattended target has to
+          // check it itself, and the server has no business holding it. The
+          // server's job is the attempt limit above, which a caller cannot skip.
+          const password = typeof msg.password === 'string' ? msg.password : '';
           safeSend(target.ws, {
             type: 'incoming',
             from: ws.deviceId,
             fromName: self?.name || '',
-            requiresPassword: Boolean(msg.password),
+            requiresPassword: password.length > 0,
+            password,
           });
           safeSend(ws, { type: 'connect_requested', to });
           return;

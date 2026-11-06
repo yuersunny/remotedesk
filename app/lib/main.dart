@@ -57,6 +57,8 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   static const _kServer = 'server_url';
   static const _kDevice = 'device_id';
+  static const _kUnattended = 'unattended';
+  static const _kUnattendedPassword = 'unattended_password';
 
   final SignalingClient _client = SignalingClient();
   final ScreenCaptureService _capture = ScreenCaptureService();
@@ -97,6 +99,27 @@ class _HomePageState extends State<HomePage> {
 
   /// Controller-side switch: forward local input to the target or not.
   bool _controlEnabled = true;
+
+  /// Target-side unattended mode: accept calls without asking anyone.
+  ///
+  /// Off by default and password-gated, because "no one clicks accept" is
+  /// indistinguishable from "anyone who can reach the signaling server gets
+  /// in" unless something else proves the caller is allowed.
+  bool _unattended = false;
+
+  /// The password this machine requires. Empty means unattended mode refuses
+  /// every caller. Stored in the platform preferences, which are readable by
+  /// the logged-in user — that is acceptable here: anyone who can read them
+  /// already controls this machine. The real exposure is the wire, so the
+  /// password only means something over wss:// or a private overlay network.
+  String _unattendedPassword = '';
+
+  final TextEditingController _passCtrl = TextEditingController();
+
+  /// The password this machine *requires* (target side). Kept apart from
+  /// [_passCtrl] so a machine that both hosts and dials can hold two different
+  /// passwords without one silently overwriting the other.
+  final TextEditingController _unattendedPassCtrl = TextEditingController();
 
   /// How many control frames this target has decoded. Counted before injection
   /// so the number is honest even where injection is unavailable (web, or a
@@ -161,6 +184,9 @@ class _HomePageState extends State<HomePage> {
       _autoRole = query['role'] ?? '';
       _useFakeCapture = query['capture'] == 'fake';
       _iceServers = _parseIceServers(query['ice']);
+      _unattended = prefs.getBool(_kUnattended) ?? false;
+      _unattendedPassword = prefs.getString(_kUnattendedPassword) ?? '';
+      _unattendedPassCtrl.text = _unattendedPassword;
     });
     _log('本机设备ID: $deviceId');
     _log(_iceServers.isEmpty
@@ -246,7 +272,7 @@ class _HomePageState extends State<HomePage> {
         if (_autoJoin && _autoRole == 'target') {
           _acceptAndShare('${m['from']}');
         } else {
-          _showIncoming(m);
+          _handleIncoming(m);
         }
         break;
       case 'accepted':
@@ -506,8 +532,61 @@ class _HomePageState extends State<HomePage> {
       _log('请填写目标设备ID');
       return;
     }
-    _client.connectTo(to);
-    _log('已请求连接 $to');
+    final password = _passCtrl.text;
+    _client.connectTo(to, password: password.isEmpty ? null : password);
+    _log('已请求连接 $to${password.isEmpty ? '' : '（带访问口令）'}');
+  }
+
+  /// Decide what to do with an inbound call.
+  ///
+  /// A machine that must be reachable while nobody is sitting at it cannot ask
+  /// permission — there is no one to click. That is a real security trade-off,
+  /// so it is opt-in and password-gated: with unattended mode off this is the
+  /// familiar dialog; with it on, only a caller presenting the right password
+  /// is accepted, and every rejected attempt is logged with the caller's id.
+  void _handleIncoming(Map<String, dynamic> m) {
+    final from = m['from'] as String? ?? '';
+    if (!_unattended) {
+      _showIncoming(m);
+      return;
+    }
+
+    if (_unattendedPassword.isEmpty) {
+      // Switched on without a password: refuse rather than hand the machine to
+      // anyone who can reach the signaling server.
+      _log('⚠ 无人值守已开启但没有设置口令，拒绝 $from');
+      _client.reject(from);
+      return;
+    }
+
+    final offered = (m['password'] as String?) ?? '';
+    if (offered.isEmpty) {
+      _log('⚠ 无人值守：$from 未提供口令，已拒绝');
+      _client.reject(from);
+      return;
+    }
+    if (!_constantTimeEquals(offered, _unattendedPassword)) {
+      _log('⚠ 无人值守：$from 口令错误，已拒绝');
+      _client.reject(from);
+      return;
+    }
+
+    _log('无人值守：已自动接受 $from');
+    _acceptAndShare(from);
+  }
+
+  /// Compare without an early return. The window here is microseconds against a
+  /// network round trip, so this is hygiene rather than a real defence — the
+  /// actual protection is the password plus the server-side attempt limit.
+  static bool _constantTimeEquals(String a, String b) {
+    final x = a.codeUnits;
+    final y = b.codeUnits;
+    var diff = x.length ^ y.length;
+    final n = x.length < y.length ? x.length : y.length;
+    for (var i = 0; i < n; i++) {
+      diff |= x[i] ^ y[i];
+    }
+    return diff == 0;
   }
 
   void _showIncoming(Map<String, dynamic> m) {
@@ -538,6 +617,54 @@ class _HomePageState extends State<HomePage> {
         ],
       ),
     );
+  }
+
+  /// Turn unattended mode on or off, persisting both the flag and the password.
+  ///
+  /// A password is mandatory to switch on: unattended mode without one would
+  /// mean "the first caller wins", and the signaling server is reachable from
+  /// anywhere on the network it runs on.
+  Future<void> _toggleUnattended(bool on) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (on) {
+      final password = _unattendedPassCtrl.text.trim();
+      if (password.length < 6) {
+        _log('⚠ 无人值守需要至少 6 位访问口令，未开启');
+        if (mounted) setState(() {});
+        return;
+      }
+      _unattendedPassword = password;
+      await prefs.setString(_kUnattendedPassword, password);
+    }
+
+    await prefs.setBool(_kUnattended, on);
+    if (!mounted) return;
+    setState(() => _unattended = on);
+    _log(on
+        ? '无人值守已开启：口令正确即自动接受，本机不再弹确认框'
+        : '无人值守已关闭：每次连接都需要本机点确认');
+
+    // An unattended machine has nobody in front of it to press "连接", so
+    // bringing the flag up must also bring the signaling link up.
+    if (on && !_connected) {
+      final url = _serverCtrl.text.trim();
+      final id = _deviceCtrl.text.trim();
+      if (url.isNotEmpty && id.isNotEmpty) {
+        _log('无人值守：自动连接信令服务器');
+        unawaited(_connect());
+      } else {
+        _log('⚠ 无人值守：服务器地址或设备ID为空，无法自动连接');
+      }
+    }
+  }
+
+  /// Keep the required password in step with the field while the mode is on.
+  Future<void> _onUnattendedPasswordChanged(String value) async {
+    if (!_unattended) return;
+    final password = value.trim();
+    _unattendedPassword = password;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kUnattendedPassword, password);
   }
 
   Future<void> _refreshSources() async {
@@ -736,6 +863,8 @@ class _HomePageState extends State<HomePage> {
                   ),
                 ],
                 const SizedBox(height: 8),
+                _field(_passCtrl, '访问口令（对方开启无人值守时必填）', obscure: true),
+                const SizedBox(height: 8),
                 Align(
                   alignment: Alignment.centerRight,
                   child: FilledButton.icon(
@@ -846,6 +975,61 @@ class _HomePageState extends State<HomePage> {
           ),
         ),
         const SizedBox(height: 10),
+        Card(
+          margin: EdgeInsets.zero,
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Expanded(child: Text('4. 无人值守（被控端生效）', style: theme.textTheme.titleSmall)),
+                    Switch(
+                      value: _unattended,
+                      onChanged: (value) => _toggleUnattended(value),
+                    ),
+                  ],
+                ),
+                Text(
+                  _unattended
+                      ? '口令正确即自动接受，这台机器不需要有人守着。'
+                      : '关闭中：每次有人呼叫，都要在本机点「接受并共享屏幕」。',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: _unattended
+                        ? theme.colorScheme.primary
+                        : theme.colorScheme.outline,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                _field(
+                  _unattendedPassCtrl,
+                  '本机访问口令（至少 6 位）',
+                  obscure: true,
+                  onChanged: _onUnattendedPasswordChanged,
+                ),
+                const SizedBox(height: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.errorContainer.withValues(alpha: 0.45),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    '开启后，知道这串口令、又能连到信令服务器的人都可以控制这台机器。\n'
+                    '信令走明文 ws:// 时口令也明文传输 —— 跨公网请改用 wss:// 或 Tailscale 这类私有网络，'
+                    '并给服务器设 AUTH_TOKEN 环境变量。',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onErrorContainer,
+                      height: 1.5,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
         // Fixed, not Expanded: in a short window the flex used to collapse to
         // zero and push everything above it off the bottom edge.
         SizedBox(height: 200, child: _logPanel(theme)),
@@ -948,9 +1132,16 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _field(TextEditingController controller, String label) {
+  Widget _field(
+    TextEditingController controller,
+    String label, {
+    bool obscure = false,
+    ValueChanged<String>? onChanged,
+  }) {
     return TextField(
       controller: controller,
+      obscureText: obscure,
+      onChanged: onChanged,
       decoration: InputDecoration(
         labelText: label,
         border: const OutlineInputBorder(),
