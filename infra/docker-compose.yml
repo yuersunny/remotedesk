@@ -1,0 +1,20 @@
+services:
+  signaling:
+    build: ../server
+    container_name: remotedesk-signaling
+    environment:
+      PORT: "8787"
+      AUTH_TOKEN: "${AUTH_TOKEN:-}"
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+
+  coturn:
+    image: coturn/coturn:latest
+    container_name: remotedesk-coturn
+    # TURN 需要大段 UDP 端口，用 host 网络最简单（仅 Linux VPS）
+    network_mode: host
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    restart: unless-stopped

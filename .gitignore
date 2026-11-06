@@ -1,0 +1,37 @@
+# --- Node ---
+node_modules/
+npm-debug.log*
+*.log
+
+# --- env / secrets ---
+.env
+infra/.env
+
+# --- Flutter / Dart ---
+app/.dart_tool/
+app/.packages
+app/build/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/macos/Pods/
+app/macos/.symlinks/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+.DS_Store
+
+# --- Windows 套件的分发物 ---
+# dist/windows-kit/ 下只有 .cmd / tools/*.ps1 / *.md 是手写的、要进版本库。
+# 下面这些是生成物或几十 MB 的二进制，进库只会把仓库撑成垃圾场：
+#   src/        —— pack-windows-kit.sh 从仓库根 rsync（与源码完全重复）
+#   web-preview/ —— flutter build web 的产物
+#   *.zip        —— 打包结果本身
+#   node/node.exe —— 83MB 随包分发的 Windows 运行时。**注意**：它不在 git 里，
+#                    新克隆的仓库要重新放一份，否则 00-RUN-WEB-NOW.cmd 只能退回
+#                    系统 node（或 winget install OpenJS.NodeJS.LTS）。
+dist/*.zip
+dist/windows-kit/src/
+dist/windows-kit/web-preview/
+dist/windows-kit/node/
+dist/windows-kit/BUILD-INFO.txt
