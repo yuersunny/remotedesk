@@ -256,3 +256,30 @@ codesign -d -r- app/build/macos/Build/Products/Debug/remotedesk.app
 
 顺带一个环境坑：`tccutil reset Accessibility <bundleid>` 在沙箱终端里会被拒
 （`Operation not permitted from sandbox`），所以清理旧授权行只能在界面里做。
+
+#### 6.5.1 别信终端里的 `AXIsProcessTrusted()`（差一步就误报通过）
+
+在终端直接跑 `remotedesk.app/Contents/MacOS/remotedesk`，日志会打印
+`trusted=1` 且自检 `moved=1`；但同一个二进制用 `open` 启动时是 `trusted=0`。
+
+原因：TCC 把权限检查算在**责任进程（responsible process）**头上。从终端起的进程，
+责任方是**终端**——终端自己早就授权过了，于是子进程"看起来"有权限，
+`CGEventPost` 也确实能落下去。这个绿灯是假的，它证明的是终端有权限。
+
+判据只有一个：**用 `open` 起 .app，看它自己写的日志**。
+
+```bash
+rm -f ~/Library/Logs/RemoteDesk/input.log
+open app/build/macos/Build/Products/Debug/remotedesk.app
+sleep 5
+cat ~/Library/Logs/RemoteDesk/input.log
+# input channel registered (trusted=1, bundle=..., pid=...)   ← 这才算数
+```
+
+为什么要单独写文件：`NSLog` 在窗口化 app 里既进不了 `log show`
+（`log show --predicate 'process == "remotedesk"'` 返回 0 行，沙箱下读不到统一日志），
+也拿不到 stderr（`open --stdout` 抓不到 NSLog）。不落盘的话，
+"授权到底生效没有"就只能靠看界面，而这恰恰是最不可靠的那个来源。
+
+授权生效后 ≤15 秒，日志里会出现 `self-test ... moved=1` —— 那是
+`_startWatching()` 复检到状态翻转后自动跑的，不用手点按钮。

@@ -56,9 +56,44 @@ enum MacInputInjector {
       }
     }
     self.channel = channel
-    // Visible in Console.app and `log stream`: proves the channel reached the
-    // native side even when the UI cannot be looked at.
-    NSLog("[remotedesk] input channel registered (trusted=%d)", Int32(trusted ? 1 : 0))
+    // Proves the channel reached the native side even when the UI cannot be
+    // looked at; also the first place to check for a missing grant.
+    log("input channel registered (trusted=\(trusted ? 1 : 0), "
+        + "bundle=\(Bundle.main.bundlePath), pid=\(ProcessInfo.processInfo.processIdentifier))")
+  }
+
+  // MARK: - Diagnostics
+
+  /// Log file for this build: `~/Library/Logs/RemoteDesk/input.log`.
+  ///
+  /// `NSLog` alone is not enough to answer "did the grant take effect": for a
+  /// windowed app it goes to the unified log, which `log show` cannot read
+  /// without extra entitlements, and it never reaches stderr even when the
+  /// bundle is launched through `open --stdout`. So the only observable was
+  /// the UI - exactly what was unreadable when the permission question came
+  /// up. A plain file on disk always works.
+  private static let logURL: URL? = {
+    let fm = FileManager.default
+    guard let base = fm.urls(for: .libraryDirectory, in: .userDomainMask).first else {
+      return nil
+    }
+    let dir = base.appendingPathComponent("Logs/RemoteDesk", isDirectory: true)
+    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent("input.log")
+  }()
+
+  private static func log(_ message: String) {
+    NSLog("%@", "[remotedesk] \(message)")
+    guard let url = logURL else { return }
+    let stamp = ISO8601DateFormatter().string(from: Date())
+    guard let data = "\(stamp) \(message)\n".data(using: .utf8) else { return }
+    if let handle = try? FileHandle(forWritingTo: url) {
+      defer { try? handle.close() }
+      _ = try? handle.seekToEnd()
+      try? handle.write(contentsOf: data)
+    } else {
+      try? data.write(to: url, options: .atomic)
+    }
   }
 
   // MARK: - Permission
@@ -74,7 +109,7 @@ enum MacInputInjector {
     let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
     let trustedNow = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
     promptedForAccessibility = true
-    NSLog("[remotedesk] accessibility prompt shown (trusted=%d)", Int32(trustedNow ? 1 : 0))
+    log("accessibility prompt shown (trusted=\(trustedNow ? 1 : 0))")
     return trustedNow
   }
 
@@ -85,6 +120,7 @@ enum MacInputInjector {
   /// pointer move takes, and unlike a log line it cannot succeed by accident.
   private static func pointerSelfTest() -> [String: Any] {
     guard trusted else {
+      log("self-test skipped: AXIsProcessTrusted() == false")
       return [
         "trusted": false,
         "moved": false,
@@ -106,10 +142,8 @@ enum MacInputInjector {
     post(CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
                  mouseCursorPosition: origin, mouseButton: .left))
     let moved = abs(after.x - origin.x) > 0.5 || abs(after.y - origin.y) > 0.5
-    // %d reads 32 bits: pass Int32, not Int, or the variadic frame is misread.
-    NSLog("[remotedesk] self-test origin=%d,%d after=%d,%d moved=%d",
-          Int32(origin.x), Int32(origin.y), Int32(after.x), Int32(after.y),
-          Int32(moved ? 1 : 0))
+    log("self-test origin=\(Int(origin.x)),\(Int(origin.y)) "
+        + "after=\(Int(after.x)),\(Int(after.y)) moved=\(moved ? 1 : 0)")
     return [
       "trusted": true,
       "moved": moved,
