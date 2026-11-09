@@ -40,13 +40,20 @@ class CaptureRequest {
 
   /// Default **false**, and this is the single biggest latency decision here.
   ///
-  /// A cursor painted into the captured picture inherits the whole media
+  /// A cursor composited into the captured picture inherits the whole media
   /// pipeline: capture → encode → network → decode → render. On a LAN that is
   /// 80–150 ms, over a relay it can pass half a second — and the user reads all
   /// of it as "the mouse is laggy", even though the injected event itself
   /// arrived in microseconds. The controller draws its own cursor at the local
   /// pointer position instead, so movement is immediate and only the *content*
   /// behind it lags.
+  ///
+  /// The flip side, and the reason this must be **explicit** on every platform
+  /// rather than left to a default: if the sharer's cursor stays in the frames,
+  /// the viewer sees that one *and* the one we paint, offset by the network
+  /// delay. On Windows that reads as "点鼠标时出现两个鼠标" — the frame only
+  /// refreshes when something changes, so the baked-in arrow reappears at the
+  /// new position a beat after each click.
   final bool showCursor;
 
   CaptureRequest copyWith({String? sourceId, int? width, int? height, int? frameRate, bool? showCursor}) {
@@ -90,22 +97,8 @@ class ScreenCaptureService {
 
   /// Start capturing. Must be called from a user gesture on web.
   Future<MediaStream> capture(CaptureRequest request) {
-    final video = <String, dynamic>{
-      'frameRate': request.frameRate,
-      'width': {'max': request.width, 'ideal': request.width},
-      'height': {'max': request.height, 'ideal': request.height},
-    };
-
-    if (kIsWeb) {
-      // Chrome-specific hint; ignored elsewhere.
-      video['cursor'] = request.showCursor ? 'always' : 'never';
-    } else if (request.sourceId != null) {
-      // Desktop: pick the exact screen/window the user selected.
-      video['deviceId'] = {'exact': request.sourceId};
-    }
-
     return navigator.mediaDevices.getDisplayMedia(<String, dynamic>{
-      'video': video,
+      'video': buildVideoConstraints(request, isWeb: kIsWeb),
       'audio': false,
     });
   }
@@ -126,4 +119,45 @@ class ScreenCaptureService {
       // already disposed
     }
   }
+}
+
+/// The `video` half of the `getDisplayMedia` constraints.
+///
+/// Top-level and pure so its shape can be asserted in a test — two of the three
+/// things that matter here fail **silently** instead of throwing:
+///
+///  * **`cursor` has to be passed on desktop too.** Only the web branch used to
+///    set it, so on Windows/macOS the sharer's own cursor stayed composited into
+///    every frame while the controller painted another one on top — the "two
+///    cursors" the Windows target showed. The plugin's desktop handler reads
+///    `video.cursor` and defaults to `always`.
+///  * **`frameRate` must sit under `mandatory`, and must be a `double`.** The
+///    desktop handler reads `video.mandatory.frameRate`, and its `findDouble()`
+///    accepts only a real double: an `int` arrives as int32, is treated as
+///    absent, and the capturer quietly stays on its 30 fps default. Writing
+///    `60` instead of `60.0` looks identical at the call site and does nothing.
+///  * **`width`/`height` are web-only.** Desktop ignores them and captures at
+///    native resolution; leaving them out of the desktop map keeps us from
+///    implying we asked for a size we never got.
+Map<String, dynamic> buildVideoConstraints(
+  CaptureRequest request, {
+  required bool isWeb,
+}) {
+  final String cursor = request.showCursor ? 'always' : 'never';
+  if (isWeb) {
+    return <String, dynamic>{
+      'cursor': cursor,
+      'frameRate': request.frameRate,
+      'width': <String, dynamic>{'max': request.width, 'ideal': request.width},
+      'height': <String, dynamic>{'max': request.height, 'ideal': request.height},
+    };
+  }
+  return <String, dynamic>{
+    'cursor': cursor,
+    'mandatory': <String, dynamic>{
+      'frameRate': request.frameRate.toDouble(),
+    },
+    if (request.sourceId != null)
+      'deviceId': <String, dynamic>{'exact': request.sourceId},
+  };
 }

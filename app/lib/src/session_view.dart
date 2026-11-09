@@ -46,7 +46,8 @@ class SessionView extends StatefulWidget {
   State<SessionView> createState() => _SessionViewState();
 }
 
-class _SessionViewState extends State<SessionView> with WidgetsBindingObserver {
+class _SessionViewState extends State<SessionView>
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   /// Keys we have told the target are down. Released on focus loss so the
   /// remote desktop cannot be left with a stuck modifier — a confusing failure
   /// mode where every later key arrives as Ctrl+X.
@@ -61,6 +62,25 @@ class _SessionViewState extends State<SessionView> with WidgetsBindingObserver {
   final List<int> _pressedButtons = <int>[];
 
   final FocusNode _focusNode = FocusNode(debugLabel: 'remote-input');
+
+  /// Click feedback, drawn locally the moment the button goes down.
+  ///
+  /// The remote picture cannot confirm a click any faster than the network, so
+  /// without this the first visible reaction to a click is a whole round trip
+  /// later — long enough to click twice "because nothing happened". A 260 ms
+  /// ring at the press point costs nothing and closes that gap.
+  late final AnimationController _click = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 260),
+  );
+
+  /// Where the last press happened, in this widget's coordinates.
+  Offset? _clickAt;
+
+  void _pulseClick(Offset local) {
+    _clickAt = local;
+    _click.forward(from: 0);
+  }
 
   bool get _isController => widget.session.role == SessionRole.controller;
 
@@ -98,6 +118,7 @@ class _SessionViewState extends State<SessionView> with WidgetsBindingObserver {
     HardwareKeyboard.instance.removeHandler(_onGlobalKey);
     _releaseAll();
     _cursor.dispose();
+    _click.dispose();
     _focusNode.dispose();
     super.dispose();
   }
@@ -280,6 +301,7 @@ class _SessionViewState extends State<SessionView> with WidgetsBindingObserver {
             },
             onPointerDown: (event) {
               _trackCursor(event.localPosition);
+              if (_canControl) _pulseClick(event.localPosition);
               _sendButton(fit, event, pressed: true);
             },
             onPointerUp: (event) => _sendButton(fit, event, pressed: false),
@@ -287,6 +309,10 @@ class _SessionViewState extends State<SessionView> with WidgetsBindingObserver {
             onPointerSignal: _onPointerSignal,
             child: MouseRegion(
               cursor: _canControl ? SystemMouseCursors.none : MouseCursor.defer,
+              // Leaving the picture must take the drawn arrow with it: a stale
+              // arrow parked at the last position reads as a second, frozen
+              // cursor sitting over the toolbar.
+              onExit: (_) => _cursor.value = null,
               child: GestureDetector(
                 // Take focus back when the user clicks the picture.
                 onTapDown: (_) => _focusNode.requestFocus(),
@@ -339,25 +365,43 @@ class _SessionViewState extends State<SessionView> with WidgetsBindingObserver {
                       ),
                     // The cursor is drawn here, not captured into the stream —
                     // so it tracks the physical mouse with no network in
-                    // between. See CaptureRequest.showCursor.
+                    // between. See CaptureRequest.showCursor: the sharer's own
+                    // cursor is explicitly excluded on every platform, which is
+                    // what keeps this the *only* arrow on screen.
                     if (_canControl)
                       Positioned.fill(
                         child: IgnorePointer(
-                          child: ValueListenableBuilder<Offset?>(
-                            valueListenable: _cursor,
-                            builder: (context, position, _) {
+                          child: AnimatedBuilder(
+                            animation: Listenable.merge(<Listenable>[_cursor, _click]),
+                            builder: (context, _) {
+                              final position = _cursor.value;
                               if (position == null || !fit.contains(position)) {
                                 return const SizedBox.expand();
                               }
+                              // One box holding both the arrow and the click
+                              // ring, so the repainted area stays ~56 px square
+                              // instead of covering the whole picture at pointer
+                              // rate.
+                              const half = _CursorPainter.half;
+                              final origin =
+                                  Offset(position.dx - half, position.dy - half);
+                              final clickLocal = _clickAt;
                               return Stack(
                                 children: [
                                   Positioned(
-                                    left: position.dx - 1,
-                                    top: position.dy - 1,
-                                    child: const SizedBox(
-                                      width: 20,
-                                      height: 22,
-                                      child: CustomPaint(painter: _CursorPainter()),
+                                    left: origin.dx,
+                                    top: origin.dy,
+                                    child: SizedBox(
+                                      width: half * 2,
+                                      height: half * 2,
+                                      child: CustomPaint(
+                                        painter: _CursorPainter(
+                                          clickLocal: clickLocal == null
+                                              ? null
+                                              : clickLocal - origin,
+                                          clickProgress: _click.value,
+                                        ),
+                                      ),
                                     ),
                                   ),
                                 ],
@@ -656,20 +700,48 @@ class _SessionViewState extends State<SessionView> with WidgetsBindingObserver {
 /// Hand-drawn rather than an icon font glyph because the glyph's own padding
 /// would offset the hotspot: the tip has to sit exactly at the pointer position,
 /// otherwise clicks land a few pixels away from where the user aimed.
+///
+/// The same canvas also draws the click ring, so one 56 px layer carries both
+/// and the pointer never forces a repaint of the whole picture.
 class _CursorPainter extends CustomPainter {
-  const _CursorPainter();
+  const _CursorPainter({this.clickLocal, this.clickProgress = 1});
+
+  /// Half the side of the painted box; the tip sits at its centre.
+  static const double half = 28;
+
+  /// Press point in box coordinates, or null when no ring is in flight.
+  final Offset? clickLocal;
+
+  /// 0→1 over the ring's life; 1 means "finished, draw nothing".
+  final double clickProgress;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final s = size.height / 22.0;
+    final anchor = Offset(size.width / 2, size.height / 2);
+
+    final ripple = clickLocal;
+    if (ripple != null && clickProgress < 1) {
+      final eased = Curves.easeOut.transform(clickProgress);
+      canvas.drawCircle(
+        ripple,
+        7 + 17 * eased,
+        Paint()
+          ..color = Colors.white.withValues(alpha: 0.55 * (1 - eased))
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.0,
+      );
+    }
+
+    // 22 logical px tall, measured from the tip down — the same size as before;
+    // only the canvas around it grew to make room for the ring.
     final path = Path()
-      ..moveTo(0, 0)
-      ..lineTo(0, 16 * s)
-      ..lineTo(3.6 * s, 12.4 * s)
-      ..lineTo(6.2 * s, 18.6 * s)
-      ..lineTo(8.6 * s, 17.6 * s)
-      ..lineTo(6.1 * s, 11.4 * s)
-      ..lineTo(10.6 * s, 11.4 * s)
+      ..moveTo(anchor.dx, anchor.dy)
+      ..lineTo(anchor.dx, anchor.dy + 16)
+      ..lineTo(anchor.dx + 3.6, anchor.dy + 12.4)
+      ..lineTo(anchor.dx + 6.2, anchor.dy + 18.6)
+      ..lineTo(anchor.dx + 8.6, anchor.dy + 17.6)
+      ..lineTo(anchor.dx + 6.1, anchor.dy + 11.4)
+      ..lineTo(anchor.dx + 10.6, anchor.dy + 11.4)
       ..close();
 
     canvas.drawPath(
@@ -677,12 +749,14 @@ class _CursorPainter extends CustomPainter {
       Paint()
         ..color = const Color(0xCC000000)
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 2.6 * s
+        ..strokeWidth = 2.6
         ..strokeJoin = StrokeJoin.round,
     );
     canvas.drawPath(path, Paint()..color = Colors.white);
   }
 
   @override
-  bool shouldRepaint(covariant _CursorPainter oldDelegate) => false;
+  bool shouldRepaint(covariant _CursorPainter oldDelegate) =>
+      oldDelegate.clickLocal != clickLocal ||
+      oldDelegate.clickProgress != clickProgress;
 }

@@ -157,6 +157,16 @@ New-NetFirewallRule -DisplayName "RemoteDesk" -Direction Inbound `
 
 日志能分清「根本没连上服务器」和「连上了但被拒绝」—— 这两件事以前看起来一模一样。
 
+### 画面上只有**一个**鼠标箭头，这是对的
+
+主控端看到的箭头是本地画的，被控端的系统光标已经被明确排除在画面之外
+（`getDisplayMedia` 的 `cursor: 'never'`）。以前只对网页版设了这个，桌面端漏了，
+于是被控端的箭头留在画面里、主控又画了一个 —— 点一下鼠标就出现「两个鼠标」。
+
+代价是看不到对方的形状变化（文本竖线、拉边框的双箭头），换来的是跟手不延迟。
+如果哪天想改回「显示对方光标」，改 `app/lib/src/screen_capture.dart` 里
+`CaptureRequest.showCursor` 为 `true` 即可（会重新变卡 80~500ms）。
+
 ---
 
 ## 出问题先看这两处
