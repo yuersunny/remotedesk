@@ -68,11 +68,15 @@ fi
 
 if [ "$MODE" = "run" ]; then
   echo "==> flutter run -d macos（热重载模式，Ctrl+C 退出）"
-  exec flutter run -d macos "${PUB_FLAG[@]}"
+  # `${PUB_FLAG[@]+...}` 不是多余的花括号：macOS 自带 bash 3.2 在 set -u 下
+  # 展开空数组会直接报 "PUB_FLAG[@]: unbound variable" 并中止。只有真跑了
+  # pub get 时数组才是空的 —— 也就是说改过一次 pubspec（比如只改版本号）
+  # 之后构建必挂，而它看起来像"构建脚本坏了"。
+  exec flutter run -d macos ${PUB_FLAG[@]+"${PUB_FLAG[@]}"}
 fi
 
 echo "==> flutter build macos --$MODE"
-flutter build macos "--$MODE" "${PUB_FLAG[@]}"
+flutter build macos "--$MODE" ${PUB_FLAG[@]+"${PUB_FLAG[@]}"}
 
 BUNDLE="$APP_DIR/build/macos/Build/Products/$([ "$MODE" = "debug" ] && echo Debug || echo Release)/remotedesk.app"
 if [ ! -d "$BUNDLE" ]; then
