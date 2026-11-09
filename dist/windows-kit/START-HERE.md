@@ -66,6 +66,36 @@ Building with plugins requires symlink support.
 
 `01-check-env.cmd` 和 `04-build-windows.cmd` 都会先检查这一项。
 
+### ⚠️ 编译报 C2220 / C4819（中文 Windows 专有）
+
+如果编译到 `[3/3] flutter build windows` 时报：
+
+```
+...\.plugin_symlinks\flutter_webrtc\common\csp\rfl_media_stream.cc(1,1):
+error C2220: 以下警告被视为错误
+... warning C4819: 该文件包含不能在当前代码页(936)中表示的字符
+```
+
+这不是你的环境坏了，也不是依赖没装好，是**编译器按 GBK 读 UTF-8 源码**：
+
+- 中文 Windows 的 ANSI 代码页是 936，MSVC 默认按它解码每个 `.cc`；
+- 第三方插件（`flutter_webrtc`）的源码是 UTF-8，注释里带非 ASCII 字符；
+- Flutter 模板又给所有目标加了 `/WX`（警告当错误），于是这条纯编码提示直接中断编译。
+
+`chcp 65001` 解决不了（它改的是控制台代码页，不是编译器读文件用的 ANSI 代码页）。
+
+**本包已修**：`app\windows\CMakeLists.txt` 里给 MSVC 加了 `/utf-8 /wd4819`。
+如果你手上是更早的包，手动补两行即可（`app\windows\CMakeLists.txt`，
+在 `add_definitions(-DUNICODE -D_UNICODE)` 后面）：
+
+```cmake
+if(MSVC)
+  add_compile_options(/utf-8 /wd4819)
+endif()
+```
+
+改完直接重跑 `04-build-windows.cmd`，不用 `flutter clean`。
+
 ---
 
 ## 两台机器怎么连（两步）

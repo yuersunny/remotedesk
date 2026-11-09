@@ -32,6 +32,30 @@ set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
 # Use Unicode for all projects.
 add_definitions(-DUNICODE -D_UNICODE)
 
+# Read source files as UTF-8, and stop treating "file is not in the code page"
+# as an error.
+#
+# Why: on a Chinese Windows the compiler assumes every .cc is encoded in the
+# system ANSI code page (936 / GBK). Third-party plugin sources are UTF-8, so
+# any non-ASCII byte sequence they contain triggers C4819 ("该文件包含不能在
+# 当前代码页(936)中表示的字符"). Flutter's template then adds /WX to every
+# target, and that purely informational warning becomes error C2220 — the build
+# stops on the first such file, in code we do not own. Observed on the Windows
+# kit at flutter_webrtc's common/csp/rfl_media_stream.cc, rfl_peer_connection.cc
+# and rfl_screen_capture.cc.
+#
+# /utf-8 is the real fix (tell the compiler the truth about the encoding);
+# /wd4819 is belt and braces for any file that still trips it. Also note chcp
+# 65001 does NOT help — it changes the console code page, not the ANSI code page
+# the compiler reads.
+#
+# The same two options are repeated in APPLY_STANDARD_SETTINGS on purpose:
+# directory-level options cover plugins that never call that function, and
+# target-level options cover the ones that do. Both paths have to be closed.
+if(MSVC)
+  add_compile_options(/utf-8 /wd4819)
+endif()
+
 # Compilation settings that should be applied to most targets.
 #
 # Be cautious about adding new options here, as plugins use this function by
@@ -40,6 +64,8 @@ add_definitions(-DUNICODE -D_UNICODE)
 function(APPLY_STANDARD_SETTINGS TARGET)
   target_compile_features(${TARGET} PUBLIC cxx_std_17)
   target_compile_options(${TARGET} PRIVATE /W4 /WX /wd"4100")
+  # See the /utf-8 block above for why these two ride along with /WX.
+  target_compile_options(${TARGET} PRIVATE /utf-8 /wd"4819")
   target_compile_options(${TARGET} PRIVATE /EHsc)
   target_compile_definitions(${TARGET} PRIVATE "_HAS_EXCEPTIONS=0")
   target_compile_definitions(${TARGET} PRIVATE "$<$<CONFIG:Debug>:_DEBUG>")
