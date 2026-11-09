@@ -42,6 +42,27 @@ class InputChannel {
   final int maxPending;
 
   RTCDataChannel? _dc;
+
+  /// Second, disposable channel for pointer movement only.
+  ///
+  /// Movement is unique among input events: a stale sample is worthless, and
+  /// there are dozens of them per second. Putting them on the reliable channel
+  /// means one lost SCTP packet stalls every later move until it is retransmitted
+  /// — over a lossy link (Wi-Fi, a TURN relay) that turns into a cursor which
+  /// lags further behind the more you move. This one is unordered with a 30 ms
+  /// retransmit window: a dropped move is simply dropped.
+  ///
+  /// Buttons, wheel and keys must never move here — a lost key-up leaves a
+  /// modifier stuck down on the remote machine.
+  RTCDataChannel? _moveDc;
+  bool _moveOpen = false;
+  Timer? _moveTicker;
+  final MoveCoalescer _moves = MoveCoalescer();
+
+  /// Movement is coalesced to one sample per tick: intermediate positions carry
+  /// no information the target can use, they only queue up.
+  static const Duration _moveTick = Duration(milliseconds: 16);
+
   final List<String> _pending = <String>[];
   final StreamController<InputEvent> _events =
       StreamController<InputEvent>.broadcast();
@@ -84,6 +105,48 @@ class InputChannel {
     }
   }
 
+  /// Attach the movement channel (see [_moveDc]). Safe to call once.
+  ///
+  /// Until this channel opens, moves keep using the reliable channel, so an
+  /// older peer that ignores the extra label still gets a working — merely
+  /// laggier — pointer. No timeout or probing is needed for that fallback: the
+  /// fast path is simply gated on [_moveOpen].
+  void attachMove(RTCDataChannel channel) {
+    if (_moveDc != null) return;
+    _moveDc = channel;
+    channel.onDataChannelState = (state) {
+      final open = state == RTCDataChannelState.RTCDataChannelOpen;
+      if (open == _moveOpen) return;
+      _moveOpen = open;
+      if (open) {
+        onLog?.call('移动通道已就绪（无序传输）');
+        _moveTicker ??= Timer.periodic(_moveTick, (_) => _flushMove());
+      } else {
+        _moveTicker?.cancel();
+        _moveTicker = null;
+        _moves.clear();
+        onLog?.call('移动通道已关闭，回退到可靠通道');
+      }
+    };
+    if (channel.state == RTCDataChannelState.RTCDataChannelOpen) {
+      _moveOpen = true;
+      _moveTicker ??= Timer.periodic(_moveTick, (_) => _flushMove());
+    }
+  }
+
+  /// Send at most one coalesced move per tick, always the newest one.
+  void _flushMove() {
+    final move = _moves.take();
+    if (move == null) return;
+    final dc = _moveDc;
+    if (dc == null || !_moveOpen) return;
+    try {
+      dc.send(RTCDataChannelMessage(move.encodeCompact()));
+    } catch (_) {
+      // Dropping a move is harmless; the next tick carries a fresher position.
+    }
+  }
+
   void _setOpen(bool open) {
     if (_open == open) return;
     _open = open;
@@ -105,6 +168,13 @@ class InputChannel {
 
   /// Send one event, or queue it if the channel is not ready yet.
   void send(InputEvent event) {
+    // Movement takes the fast path as soon as it is available: overwrite the
+    // pending sample and let the ticker pick the newest one up. Nothing is
+    // queued here, so a burst of 200 mouse events cannot build a backlog.
+    if (event is PointerMove && _moveOpen) {
+      _moves.submit(event);
+      return;
+    }
     // Pointer moves dominate the traffic; the compact encoder avoids building
     // an intermediate map 60 times a second.
     final frame = event is PointerMove ? event.encodeCompact() : event.encode();
@@ -133,7 +203,13 @@ class InputChannel {
     if (event != null) _events.add(event);
   }
 
-  Future<void> dispose() async {
+  Future<void> dispose() async {    _moveTicker?.cancel();
+    _moveTicker = null;
+    _moves.clear();
+    _moveOpen = false;
+    final moveDc = _moveDc;
+    _moveDc = null;
+
     final dc = _dc;
     _dc = null;
     _open = false;
@@ -141,6 +217,12 @@ class InputChannel {
     // Release anyone awaiting `opened`, so a handshake that never got a chance
     // to run does not leak a pending future.
     if (!_opened.isCompleted) _opened.complete();
+    if (moveDc != null) {
+      try {
+        moveDc.onDataChannelState = null;
+        await moveDc.close();
+      } catch (_) {}
+    }
     if (dc != null) {
       try {
         dc.onMessage = null;
@@ -152,4 +234,42 @@ class InputChannel {
     }
     await _events.close();
   }
+}
+
+/// Keeps only the newest pointer sample between ticks.
+///
+/// Plain "send every event" is what makes a remote cursor fall behind: 120
+/// events per second enter SCTP faster than a congested link drains them, and
+/// every sample queued in front of the newest one is already obsolete. Keeping
+/// a single slot means the send rate is capped by the tick, not by how fast the
+/// user moves the mouse.
+///
+/// Separated from [InputChannel] so the policy can be tested without a real
+/// data channel.
+class MoveCoalescer {
+  PointerMove? _pending;
+
+  /// Samples replaced before being sent — the number that proves the coalescing
+  /// actually happened, exposed for diagnostics and tests.
+  int dropped = 0;
+
+  bool get hasPending => _pending != null;
+
+  /// Store a sample, replacing any that has not been taken yet.
+  /// Returns true when an earlier sample was discarded.
+  bool submit(PointerMove move) {
+    final replaced = _pending != null;
+    _pending = move;
+    if (replaced) dropped++;
+    return replaced;
+  }
+
+  /// Take the newest sample and clear the slot.
+  PointerMove? take() {
+    final move = _pending;
+    _pending = null;
+    return move;
+  }
+
+  void clear() => _pending = null;
 }

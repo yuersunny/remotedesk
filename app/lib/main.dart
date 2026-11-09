@@ -1,6 +1,9 @@
 import 'dart:async';
+import 'dart:math' show Random;
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
@@ -8,11 +11,16 @@ import 'package:uuid/uuid.dart';
 // Prefixed: `package:flutter/material.dart` also exports a `KeyEvent`
 // (the hardware-keyboard one), and this file needs both.
 import 'src/input_event.dart' as proto;
+import 'src/diag_log.dart';
 import 'src/input_injector.dart';
 import 'src/rtc_session.dart';
 import 'src/screen_capture.dart';
 import 'src/session_view.dart';
 import 'src/signaling_client.dart';
+// Desktop builds can host the relay themselves; a browser tab cannot, hence the
+// conditional import rather than a story about "run node somewhere".
+import 'src/signaling_server_stub.dart'
+    if (dart.library.io) 'src/signaling_server_io.dart';
 import 'src/window_title.dart';
 
 /// ICE servers used by every session.
@@ -26,8 +34,40 @@ const List<Map<String, dynamic>> kDefaultIceServers = <Map<String, dynamic>>[
   <String, dynamic>{'urls': 'stun:stun.cloudflare.com:3478'},
 ];
 
-void main() {
-  runApp(const RemoteDeskApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Opened *before* the app runs, not in parallel with it.
+  //
+  // Starting the log concurrently looked harmless and was not: opening the file
+  // takes tens of milliseconds, the startup sequence takes fewer, so every line
+  // describing how startup went — including why the signaling connection
+  // failed — landed while the writer was still null and was discarded. The log
+  // then contained a "开始" line and nothing else, which reads exactly like a
+  // crash. Disk I/O here is a few milliseconds and blocks nothing the user can
+  // perceive.
+  await DiagLog.start();
+
+  // Everything else runs inside a guarded zone: an exception thrown from an
+  // `await` in startup code is otherwise swallowed, and the app just sits there
+  // looking normal with nothing connected.
+  runZonedGuarded(() {
+    // Uncaught framework errors go to the file as well: on a machine we cannot
+    // reach, a red screen is indistinguishable from "it just does nothing".
+    FlutterError.onError = (details) {
+      FlutterError.presentError(details);
+      DiagLog.write('[FLUTTER] ${details.exceptionAsString()}');
+      final stack = details.stack;
+      if (stack != null) DiagLog.write('[FLUTTER] $stack');
+      unawaited(DiagLog.forceFlush());
+    };
+
+    runApp(const RemoteDeskApp());
+  }, (error, stack) {
+    DiagLog.write('[UNCAUGHT] $error');
+    DiagLog.write('[UNCAUGHT] $stack');
+    unawaited(DiagLog.forceFlush());
+  });
 }
 
 class RemoteDeskApp extends StatelessWidget {
@@ -66,6 +106,21 @@ class _HomePageState extends State<HomePage> {
   final TextEditingController _serverCtrl = TextEditingController(text: 'ws://127.0.0.1:8787/ws');
   final TextEditingController _deviceCtrl = TextEditingController();
   final TextEditingController _targetCtrl = TextEditingController();
+
+  /// The relay, hosted by this app when no other server is configured.
+  ///
+  /// See [LocalSignalingServer] for why this lives inside the app: it is the
+  /// only way "the office machine is reachable from home" survives a reboot
+  /// without a second process that someone has to keep alive.
+  late final LocalSignalingServer _localServer =
+      LocalSignalingServer(onLog: (message) => _log('[服务] $message'));
+
+  /// True once the port bound — i.e. other machines should be pointed here.
+  bool _hosting = false;
+
+  /// What the *other* machine should type into 高级设置, e.g.
+  /// `ws://100.101.102.103:8787/ws`. Empty while not hosting.
+  String _peerServerUrl = '';
 
   StreamSubscription<Map<String, dynamic>>? _sub;
   final List<String> _logs = <String>[];
@@ -147,7 +202,13 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _sub = _client.events.listen(_onEvent);
-    _bootstrap();
+    // Not `unawaited`: a startup failure has to be visible in the log with a
+    // reason, not silently leave the app sitting there unconnected.
+    _bootstrap().catchError((Object error, StackTrace stack) {
+      _log('[启动失败] $error');
+      _log('$stack');
+      unawaited(DiagLog.forceFlush());
+    });
     // Probe the injector once, up front: knowing early that this build cannot
     // inject input is far more useful than discovering it after a session.
     _injector.init().then((support) {
@@ -196,8 +257,60 @@ class _HomePageState extends State<HomePage> {
     if (_autoJoin) {
       _log('自检模式：自动连接（role=$_autoRole, fakeCapture=$_useFakeCapture）');
       await Future<void>.delayed(const Duration(milliseconds: 300));
-      await _connect();
     }
+    // Become the relay when nobody else is one.
+    //
+    // The Node server needed a separate process plus something to keep it alive
+    // across reboots, and on this machine the login-item route could not even be
+    // verified — launchd refused to bootstrap it. The machine being controlled
+    // has the app running anyway, so letting the app listen costs nothing and
+    // removes the moving part that "connect from home tomorrow" depended on.
+    //
+    // Only when the saved address points at this machine or at nothing: if the
+    // user deliberately configured another host, two islands both reporting
+    // "online" on their own loopback would never see each other.
+    final configured = _serverCtrl.text.trim();
+    if (configured.isEmpty || _isLocalAddress(configured)) {
+      await _startHosting(quietWhenTaken: configured.isNotEmpty);
+    }
+
+    // Connect at launch either way. "Fill in a server address, then press 连接"
+    // was a step users should never have had to think about — the address is
+    // remembered, so being online from the first second is the only sensible
+    // default. Failure is logged and leaves the app usable.
+    await _connect();
+  }
+
+  /// Bind the relay and remember what to tell the other machine.
+  Future<void> _startHosting({bool quietWhenTaken = false}) async {
+    final ok = await _localServer.start(port: 8787);
+    if (!ok) {
+      // Normal: the Node server, or a second copy of this app, already serves.
+      if (!quietWhenTaken) _log('端口 8787 已被占用，直接连它');
+      return;
+    }
+    final ips = await localIpv4Addresses();
+    final picked = pickPeerAddress(ips);
+    if (!mounted) return;
+    setState(() {
+      _hosting = true;
+      _peerServerUrl = picked == null ? '' : 'ws://$picked:8787/ws';
+    });
+    _log(picked == null
+        ? '本机已作为信令服务器（端口 8787）'
+        : '本机已作为信令服务器（端口 8787），对方要填 $_peerServerUrl');
+    final others = ips.where((ip) => ip != picked).toList();
+    if (others.isNotEmpty) _log('本机其它可用地址: ${others.join(', ')}');
+  }
+
+  /// Is this URL aimed at the machine we are running on?
+  static bool _isLocalAddress(String url) {
+    final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
+    return host == '127.0.0.1' ||
+        host == 'localhost' ||
+        host == '::1' ||
+        host == '0.0.0.0' ||
+        host.isEmpty;
   }
 
   @override
@@ -208,6 +321,9 @@ class _HomePageState extends State<HomePage> {
     _session?.close();
     _injector.dispose();
     _client.dispose();
+    // Release the port: a relaunch should be able to take it back immediately
+    // rather than trip over the socket the previous instance left behind.
+    unawaited(_localServer.stop());
     _serverCtrl.dispose();
     _deviceCtrl.dispose();
     _targetCtrl.dispose();
@@ -216,6 +332,9 @@ class _HomePageState extends State<HomePage> {
 
   void _log(String message) {
     final t = DateTime.now().toIso8601String().substring(11, 19);
+    // Written before the `mounted` check: the most interesting lines are often
+    // the ones produced while shutting down.
+    DiagLog.write('[$t] $message');
     if (!mounted) return;
     setState(() {
       _logs.insert(0, '[$t] $message');
@@ -297,7 +416,9 @@ class _HomePageState extends State<HomePage> {
         _log('设备离线: ${m['id']}');
         break;
       case 'error':
-        _log('⚠ 错误: ${m['code']} ${m['message'] ?? ''}');
+        // The server speaks in codes; a person needs a sentence and a next
+        // step. `rate_limited` in particular looks like a bug otherwise.
+        _log('⚠ ${_errorText(m['code'])}');
         setState(() => _busy = false);
         break;
       case 'transport_closed':
@@ -314,10 +435,13 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _connect() async {
+    // Guarded: the launch path connects automatically, and the reconnect button
+    // in 高级设置 goes through the same function.
+    if (_connected) return;
     final url = _serverCtrl.text.trim();
     final id = _deviceCtrl.text.trim();
     if (url.isEmpty || id.isEmpty) {
-      _log('请填写服务器地址和设备ID');
+      _log('服务器地址或本机 ID 为空');
       return;
     }
     final prefs = await SharedPreferences.getInstance();
@@ -325,8 +449,36 @@ class _HomePageState extends State<HomePage> {
     _log('正在连接 $url ...');
     try {
       await _client.connect(url: url, id: id, name: 'flutter-client');
+      return;
     } catch (e) {
       _log('连接失败: $e');
+    }
+
+    // Fall back to a signaling server on this very machine.
+    //
+    // The saved address is often one that used to be right — another machine's
+    // tailnet IP, yesterday's LAN address — and a stale address is the single
+    // most common reason for "it just doesn't connect". When this machine
+    // happens to be running the server itself, that is a strictly better guess
+    // than leaving the app offline, and the switch is written to the log.
+    const local = 'ws://127.0.0.1:8787/ws';
+    if (url == local) return;
+    _log('改用本机服务器再试一次…');
+    // Serve it here if nothing else does, so the app still comes up online
+    // instead of sitting dead on a stale address.
+    if (!_localServer.running) {
+      await _startHosting(quietWhenTaken: true);
+      if (!_localServer.running) return;
+      _log('（注意：此时只有连到本机的设备互相可见；对方若连的是别的服务器，两边看不到彼此）');
+    }
+    try {
+      await _client.connect(url: local, id: id, name: 'flutter-client');
+      if (!mounted) return;
+      setState(() => _serverCtrl.text = local);
+      await prefs.setString(_kServer, local);
+      _log('已改用本机服务器 $local（地址已记住）');
+    } catch (e) {
+      _log('本机也没有可用的服务器: $e');
     }
   }
 
@@ -382,7 +534,7 @@ class _HomePageState extends State<HomePage> {
               'video': <String, dynamic>{'width': 1280, 'height': 720, 'frameRate': 30},
               'audio': false,
             })
-          : await _capture.capture(_request);
+          : await _capture.capture(await _resolveCaptureRequest());
     } catch (e) {
       _log('屏幕采集被取消或失败: $e');
       _client.reject(peer);
@@ -621,17 +773,19 @@ class _HomePageState extends State<HomePage> {
 
   /// Turn unattended mode on or off, persisting both the flag and the password.
   ///
-  /// A password is mandatory to switch on: unattended mode without one would
-  /// mean "the first caller wins", and the signaling server is reachable from
-  /// anywhere on the network it runs on.
+  /// Switching on with no password used to fail with "口令需要至少 6 位" and
+  /// leave the switch off — a dead end the user could only escape by typing
+  /// something first. A machine that is about to sit there unattended needs a
+  /// secret, not a prompt to invent one, so one is generated and shown. The
+  /// password stays editable for anyone who wants to choose their own.
   Future<void> _toggleUnattended(bool on) async {
     final prefs = await SharedPreferences.getInstance();
     if (on) {
-      final password = _unattendedPassCtrl.text.trim();
+      var password = _unattendedPassCtrl.text.trim();
       if (password.length < 6) {
-        _log('⚠ 无人值守需要至少 6 位访问口令，未开启');
-        if (mounted) setState(() {});
-        return;
+        password = _generatePassword();
+        _unattendedPassCtrl.text = password;
+        _log('已自动生成访问口令：$password（可在「密码」框里改）');
       }
       _unattendedPassword = password;
       await prefs.setString(_kUnattendedPassword, password);
@@ -665,6 +819,107 @@ class _HomePageState extends State<HomePage> {
     _unattendedPassword = password;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_kUnattendedPassword, password);
+  }
+
+  /// Six digits, `Random.secure` so the value is not predictable from the clock.
+  ///
+  /// Six digits is only defensible because the server rate-limits attempts to
+  /// 10 per minute per caller (see server/src/server.js): 10^6 guesses at that
+  /// rate is about three months, and the address is not discoverable anyway.
+  static String _generatePassword() {
+    final random = Random.secure();
+    return List<int>.generate(6, (_) => random.nextInt(10)).join();
+  }
+
+  Future<void> _copyToClipboard(String label, String value) async {
+    if (value.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: value));
+    _log('已复制$label: $value');
+  }
+
+  /// Rename this machine. The ID is generated at first launch, which is fine
+  /// for a stranger's machine but useless when the same person has to tell
+  /// colleagues "connect to 85262df3" — a chosen name is easier to say.
+  Future<void> _editDeviceId() async {
+    final controller = TextEditingController(text: _deviceCtrl.text);
+    final value = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('修改本机 ID'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '本机 ID',
+            helperText: '对方用这个 ID 连你。建议用字母数字，不要空格',
+          ),
+          onSubmitted: (text) => Navigator.pop(context, text.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim()),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (value == null || value.isEmpty || value == _deviceCtrl.text) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kDevice, value);
+    // Must re-register: the server keys devices by this ID.
+    await _disconnect();
+    if (!mounted) return;
+    setState(() => _deviceCtrl.text = value);
+    await _connect();
+    _log('本机 ID 已改为 $value');
+  }
+
+  /// Turn a signaling error code into something a person can act on.
+  static String _errorText(Object? code) {
+    return switch (code) {
+      'target_offline' => '对方不在线 —— 确认那台机器开着程序，且 ID 没打错',
+      'rate_limited' => '尝试太频繁了，等一分钟再连',
+      'id_taken' => '这个 ID 已被别的设备占用，换一个（高级设置里可以改）',
+      'no_target' => '请先填对方 ID',
+      'bad_token' => '服务器要求鉴权码，当前版本没有对应输入框',
+      _ => '出错了（${code ?? "未知"}）',
+    };
+  }
+
+  /// Make sure a desktop capture request names a concrete source.
+  ///
+  /// Only the browser has a "let the user pick a screen" dialog. On macOS and
+  /// Windows the media layer needs an explicit `deviceId`; asking for
+  /// `getDisplayMedia` without one fails, and a failed capture makes this
+  /// machine *reject the call* — which the controller can only read as "连不上".
+  /// That is exactly how Windows behaved as a target while macOS worked.
+  ///
+  /// An explicit choice made in 高级设置 always wins, so this only fills a gap.
+  Future<CaptureRequest> _resolveCaptureRequest() async {
+    if (kIsWeb || _request.sourceId != null) return _request;
+    try {
+      final sources = await _capture.listSources();
+      if (sources.isEmpty) {
+        _log('⚠ 没有枚举到可采集的屏幕，可能缺少屏幕录制权限');
+        return _request;
+      }
+      final screen = sources.firstWhere(
+        (s) => s.isScreen,
+        orElse: () => sources.first,
+      );
+      _request = _request.copyWith(sourceId: screen.id);
+      if (mounted) setState(() => _sources = sources);
+      _log('采集源: $screen');
+    } catch (e) {
+      _log('枚举采集源失败: $e');
+    }
+    return _request;
   }
 
   Future<void> _refreshSources() async {
@@ -793,246 +1048,429 @@ class _HomePageState extends State<HomePage> {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Card(
-          margin: EdgeInsets.zero,
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Text('1. 连接信令', style: theme.textTheme.titleSmall),
-                const SizedBox(height: 8),
-                _field(_serverCtrl, '信令服务器 (ws://host:port/ws)'),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Expanded(child: _field(_deviceCtrl, '本机设备ID')),
-                    const SizedBox(width: 8),
-                    FilledButton(
-                      onPressed: _connected ? null : _connect,
-                      child: const Text('连接'),
-                    ),
-                    const SizedBox(width: 6),
-                    OutlinedButton(
-                      onPressed: _connected ? _disconnect : null,
-                      child: const Text('断开'),
-                    ),
-                  ],
-                ),
-                if (_selfId != null) ...[
-                  const SizedBox(height: 6),
-                  Text('我的ID: $_selfId',
-                      style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.primary)),
-                ],
-              ],
-            ),
-          ),
-        ),
+        if (!_connected) ...[
+          _offlineBanner(theme),
+          const SizedBox(height: 10),
+        ],
+        _thisDeviceCard(theme),
         const SizedBox(height: 10),
-        Card(
-          margin: EdgeInsets.zero,
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Text('2. 发起远程协助', style: theme.textTheme.titleSmall),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Expanded(child: _field(_targetCtrl, '目标设备ID')),
-                    const SizedBox(width: 8),
-                    OutlinedButton(
-                      onPressed: _connected ? _client.listDevices : null,
-                      child: const Text('刷新'),
-                    ),
-                  ],
-                ),
-                if (_peers.isNotEmpty) ...[
-                  const SizedBox(height: 8),
-                  Wrap(
-                    spacing: 6,
-                    runSpacing: 4,
-                    children: [
-                      for (final peer in _peers)
-                        ActionChip(
-                          label: Text(peer['id']!),
-                          onPressed: () => setState(() => _targetCtrl.text = peer['id']!),
-                        ),
-                    ],
-                  ),
-                ],
-                const SizedBox(height: 8),
-                _field(_passCtrl, '访问口令（对方开启无人值守时必填）', obscure: true),
-                const SizedBox(height: 8),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: FilledButton.icon(
-                    onPressed: _connected && _session == null ? _call : null,
-                    icon: const Icon(Icons.call),
-                    label: const Text('呼叫'),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
+        _connectCard(theme),
         const SizedBox(height: 10),
-        Card(
-          margin: EdgeInsets.zero,
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Text('3. 采集设置（被控端生效）', style: theme.textTheme.titleSmall),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Expanded(
-                      child: DropdownButtonFormField<int>(
-                        initialValue: _frameRate,
-                        decoration: const InputDecoration(
-                          labelText: '帧率',
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                        ),
-                        items: const [
-                          DropdownMenuItem(value: 15, child: Text('15 fps')),
-                          DropdownMenuItem(value: 30, child: Text('30 fps')),
-                          DropdownMenuItem(value: 60, child: Text('60 fps')),
-                        ],
-                        onChanged: (v) => setState(() {
-                          _frameRate = v ?? 30;
-                          _request = _request.copyWith(frameRate: _frameRate);
-                        }),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: DropdownButtonFormField<int>(
-                        initialValue: _maxHeight,
-                        decoration: const InputDecoration(
-                          labelText: '上限分辨率',
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                        ),
-                        items: const [
-                          DropdownMenuItem(value: 720, child: Text('720p')),
-                          DropdownMenuItem(value: 1080, child: Text('1080p')),
-                          DropdownMenuItem(value: 1440, child: Text('1440p')),
-                          DropdownMenuItem(value: 2160, child: Text('4K')),
-                        ],
-                        onChanged: (v) => setState(() {
-                          _maxHeight = v ?? 1080;
-                          _request = _request.copyWith(
-                            height: _maxHeight,
-                            width: (_maxHeight * 16 / 9).round(),
-                          );
-                        }),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Expanded(
-                      child: _sources.isEmpty
-                          ? Text('采集源: 由系统弹窗选择',
-                              style: theme.textTheme.bodySmall
-                                  ?.copyWith(color: theme.colorScheme.outline))
-                          : DropdownButtonFormField<String>(
-                              initialValue: _request.sourceId,
-                              isExpanded: true,
-                              decoration: const InputDecoration(
-                                labelText: '采集源',
-                                border: OutlineInputBorder(),
-                                isDense: true,
-                              ),
-                              items: [
-                                for (final source in _sources)
-                                  DropdownMenuItem(
-                                    value: source.id,
-                                    child: Text(source.toString(), overflow: TextOverflow.ellipsis),
-                                  ),
-                              ],
-                              onChanged: (v) =>
-                                  setState(() => _request = _request.copyWith(sourceId: v)),
-                            ),
-                    ),
-                    const SizedBox(width: 8),
-                    OutlinedButton(
-                      onPressed: _refreshSources,
-                      child: const Text('枚举采集源'),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                _injectionStatus(theme),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 10),
-        Card(
-          margin: EdgeInsets.zero,
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Row(
-                  children: [
-                    Expanded(child: Text('4. 无人值守（被控端生效）', style: theme.textTheme.titleSmall)),
-                    Switch(
-                      value: _unattended,
-                      onChanged: (value) => _toggleUnattended(value),
-                    ),
-                  ],
-                ),
-                Text(
-                  _unattended
-                      ? '口令正确即自动接受，这台机器不需要有人守着。'
-                      : '关闭中：每次有人呼叫，都要在本机点「接受并共享屏幕」。',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: _unattended
-                        ? theme.colorScheme.primary
-                        : theme.colorScheme.outline,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                _field(
-                  _unattendedPassCtrl,
-                  '本机访问口令（至少 6 位）',
-                  obscure: true,
-                  onChanged: _onUnattendedPasswordChanged,
-                ),
-                const SizedBox(height: 8),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: theme.colorScheme.errorContainer.withValues(alpha: 0.45),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    '开启后，知道这串口令、又能连到信令服务器的人都可以控制这台机器。\n'
-                    '信令走明文 ws:// 时口令也明文传输 —— 跨公网请改用 wss:// 或 Tailscale 这类私有网络，'
-                    '并给服务器设 AUTH_TOKEN 环境变量。',
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      color: theme.colorScheme.onErrorContainer,
-                      height: 1.5,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
+        _advancedCard(theme),
         const SizedBox(height: 10),
         // Fixed, not Expanded: in a short window the flex used to collapse to
         // zero and push everything above it off the bottom edge.
-        SizedBox(height: 200, child: _logPanel(theme)),
+        SizedBox(height: 170, child: _logPanel(theme)),
+      ],
+    );
+  }
+
+  /// Shown only while the signaling link is down.
+  ///
+  /// Without this, "auto-connect on launch" turns a wrong server address into a
+  /// silently dead app: the window looks normal, nothing is online, and the fix
+  /// is buried in a collapsed section. The banner names the actual address it
+  /// tried, which is usually enough to spot a 127.0.0.1 on the wrong machine.
+  Widget _offlineBanner(ThemeData theme) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.errorContainer.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.cloud_off, size: 18, color: theme.colorScheme.onErrorContainer),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              '还没连上信令服务器（${_serverCtrl.text}）。\n'
+              '两台机器要填同一个地址 —— 填运行服务器那台的地址，末尾的 /ws 别漏。',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onErrorContainer,
+                height: 1.5,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// "This computer": the two things another person needs, and the switch that
+  /// decides whether it can be controlled at all.
+  ///
+  /// This is the whole model, borrowed from every consumer remote-desktop tool:
+  /// you read an ID and a password off this card, you type them on the other
+  /// machine, you are in. Nothing here asks the user to understand sessions,
+  /// roles or signaling.
+  Widget _thisDeviceCard(ThemeData theme) {
+    final selfId = _selfId ?? _deviceCtrl.text;
+    final open = _unattended;
+    final idStyle = theme.textTheme.headlineSmall?.copyWith(
+      fontWeight: FontWeight.w600,
+      letterSpacing: 2,
+      color: theme.colorScheme.onSurface,
+    );
+
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Text('这台电脑', style: theme.textTheme.titleSmall),
+                const Spacer(),
+                _onlineChip(theme),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '本机 ID',
+                        style: theme.textTheme.labelSmall
+                            ?.copyWith(color: theme.colorScheme.outline),
+                      ),
+                      const SizedBox(height: 2),
+                      SelectableText(selfId.isEmpty ? '—' : selfId, style: idStyle),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  onPressed: () => _copyToClipboard('本机 ID', selfId),
+                  icon: const Icon(Icons.copy, size: 18),
+                  tooltip: '复制 ID',
+                ),
+                IconButton(
+                  onPressed: _editDeviceId,
+                  icon: const Icon(Icons.edit_outlined, size: 18),
+                  tooltip: '改 ID',
+                ),
+              ],
+            ),
+            // Only when we are the server: this is the one string the other
+            // machine needs beyond the ID and password. Buried in 高级设置 it is
+            // the step people skip, and skipping it is what produces "连不上".
+            if (_hosting && _peerServerUrl.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              InkWell(
+                borderRadius: BorderRadius.circular(6),
+                onTap: () => _copyToClipboard('服务器地址', _peerServerUrl),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: Row(
+                    children: [
+                      Icon(Icons.dns_outlined,
+                          size: 14, color: theme.colorScheme.outline),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          '对方服务器填 $_peerServerUrl',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.outline,
+                          ),
+                        ),
+                      ),
+                      Icon(Icons.copy,
+                          size: 14, color: theme.colorScheme.outline),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+            const Divider(height: 20),
+            Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('允许远程控制'),
+                      const SizedBox(height: 2),
+                      Text(
+                        open
+                            ? '密码正确即自动接受，本机不用有人守着'
+                            : '关闭：每次连接都要在本机点「接受」',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: open
+                              ? theme.colorScheme.primary
+                              : theme.colorScheme.outline,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Switch(value: open, onChanged: _toggleUnattended),
+              ],
+            ),
+            if (open) ...[
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: _field(
+                      _unattendedPassCtrl,
+                      '连接密码（对方要输入这串）',
+                      onChanged: _onUnattendedPasswordChanged,
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  IconButton(
+                    onPressed: () =>
+                        _copyToClipboard('密码', _unattendedPassCtrl.text.trim()),
+                    icon: const Icon(Icons.copy, size: 18),
+                    tooltip: '复制密码',
+                  ),
+                  IconButton(
+                    onPressed: () {
+                      final fresh = _generatePassword();
+                      _unattendedPassCtrl.text = fresh;
+                      _onUnattendedPasswordChanged(fresh);
+                      setState(() {});
+                      _log('已换新密码：$fresh');
+                    },
+                    icon: const Icon(Icons.refresh, size: 18),
+                    tooltip: '换一个密码',
+                  ),
+                ],
+              ),
+            ] else ...[
+              const SizedBox(height: 6),
+              Text(
+                '想让这台电脑无人值守，把上面的开关打开，'
+                '再把「本机 ID」和「连接密码」发给对方。',
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: theme.colorScheme.outline, height: 1.45),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// "Connect to another computer": two fields and one button.
+  Widget _connectCard(ThemeData theme) {
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('连接另一台电脑', style: theme.textTheme.titleSmall),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(flex: 5, child: _field(_targetCtrl, '对方 ID')),
+                const SizedBox(width: 8),
+                Expanded(
+                  flex: 5,
+                  child: _field(_passCtrl, '对方密码', obscure: true),
+                ),
+              ],
+            ),
+            if (_peers.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 6,
+                runSpacing: 4,
+                children: [
+                  for (final peer in _peers)
+                    ActionChip(
+                      label: Text(peer['id']!),
+                      onPressed: () =>
+                          setState(() => _targetCtrl.text = peer['id']!),
+                    ),
+                ],
+              ),
+            ],
+            const SizedBox(height: 10),
+            SizedBox(
+              height: 44,
+              child: FilledButton.icon(
+                onPressed: _connected && _session == null && !_busy ? _call : null,
+                icon: const Icon(Icons.desktop_windows_outlined),
+                label: const Text('连接'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Everything that used to be on the main path but is not part of the daily
+  /// flow: server address, picture quality, capture source, injector health.
+  Widget _advancedCard(ThemeData theme) {
+    return Card(
+      margin: EdgeInsets.zero,
+      clipBehavior: Clip.antiAlias,
+      child: Theme(
+        data: theme.copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          // Re-keyed on the link state so the section opens by itself while
+          // offline (that is where the address lives) and folds away once the
+          // connection is up.
+          key: ValueKey<String>('advanced-$_connected'),
+          initiallyExpanded: !_connected,
+          tilePadding: const EdgeInsets.symmetric(horizontal: 14),
+          childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+          title: Text('高级设置', style: theme.textTheme.titleSmall),
+          subtitle: Text(
+            '服务器地址 · 画质 · 注入诊断',
+            style: theme.textTheme.bodySmall
+                ?.copyWith(color: theme.colorScheme.outline),
+          ),
+          children: [
+            Row(
+              children: [
+                Expanded(child: _field(_serverCtrl, '信令服务器 (ws://host:port/ws)')),
+                const SizedBox(width: 8),
+                IconButton(
+                  onPressed: _connected ? _disconnect : _connect,
+                  icon: Icon(_connected ? Icons.link_off : Icons.link),
+                  tooltip: _connected ? '断开' : '重新连接',
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<int>(
+                    initialValue: _frameRate,
+                    decoration: const InputDecoration(
+                      labelText: '帧率',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    items: const [
+                      DropdownMenuItem(value: 30, child: Text('30 fps')),
+                      DropdownMenuItem(value: 60, child: Text('60 fps')),
+                    ],
+                    onChanged: (v) => setState(() {
+                      _frameRate = v ?? 60;
+                      _request = _request.copyWith(frameRate: _frameRate);
+                    }),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: DropdownButtonFormField<int>(
+                    initialValue: _maxHeight,
+                    decoration: const InputDecoration(
+                      labelText: '上限分辨率',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    items: const [
+                      DropdownMenuItem(value: 720, child: Text('720p')),
+                      DropdownMenuItem(value: 1080, child: Text('1080p')),
+                      DropdownMenuItem(value: 1440, child: Text('1440p')),
+                      DropdownMenuItem(value: 2160, child: Text('4K')),
+                    ],
+                    onChanged: (v) => setState(() {
+                      _maxHeight = v ?? 1080;
+                      _request = _request.copyWith(
+                        height: _maxHeight,
+                        width: (_maxHeight * 16 / 9).round(),
+                      );
+                    }),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: _sources.isEmpty
+                      ? Text('采集源: 由系统弹窗选择',
+                          style: theme.textTheme.bodySmall
+                              ?.copyWith(color: theme.colorScheme.outline))
+                      : DropdownButtonFormField<String>(
+                          initialValue: _request.sourceId,
+                          isExpanded: true,
+                          decoration: const InputDecoration(
+                            labelText: '采集源',
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                          ),
+                          items: [
+                            for (final source in _sources)
+                              DropdownMenuItem(
+                                value: source.id,
+                                child: Text(source.toString(),
+                                    overflow: TextOverflow.ellipsis),
+                              ),
+                          ],
+                          onChanged: (v) => setState(
+                              () => _request = _request.copyWith(sourceId: v)),
+                        ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  onPressed: _refreshSources,
+                  icon: const Icon(Icons.refresh),
+                  tooltip: '枚举采集源',
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            _injectionStatus(theme),
+            const Divider(height: 18),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: () async {
+                  final ok = await DiagLog.reveal();
+                  if (!ok) {
+                    _log('打不开日志目录（当前平台无文件系统）');
+                  }
+                },
+                icon: const Icon(Icons.folder_open, size: 16),
+                label: const Text('打开日志目录'),
+              ),
+            ),
+            if (DiagLog.enabled)
+              Padding(
+                padding: const EdgeInsets.only(left: 2),
+                child: SelectableText(
+                  '日志: ${DiagLog.path ?? ""}',
+                  style: theme.textTheme.bodySmall
+                      ?.copyWith(color: theme.colorScheme.outline, fontSize: 11),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Signaling link state as a single dot — the only "am I online" signal the
+  /// user needs, and it never moves around the layout.
+  Widget _onlineChip(ThemeData theme) {
+    final color = _connected ? const Color(0xFF22C55E) : theme.colorScheme.outline;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(Icons.circle, size: 9, color: color),
+        const SizedBox(width: 5),
+        Text(
+          _connected ? '在线' : '未连上服务器',
+          style: theme.textTheme.bodySmall?.copyWith(color: color),
+        ),
       ],
     );
   }

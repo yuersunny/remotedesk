@@ -23,8 +23,8 @@ class CaptureRequest {
     this.sourceId,
     this.width = 1920,
     this.height = 1080,
-    this.frameRate = 30,
-    this.showCursor = true,
+    this.frameRate = 60,
+    this.showCursor = false,
   });
 
   /// Desktop only: which screen/window to capture. `null` = let the user pick
@@ -32,7 +32,21 @@ class CaptureRequest {
   final String? sourceId;
   final int width;
   final int height;
+
+  /// 60 rather than 30: a remote pointer that updates 60×/s reads as "直接跟手",
+  /// while 30 reads as laggy even on a perfect network. Screen content is mostly
+  /// static, so the extra frames cost little (the encoder emits delta frames).
   final int frameRate;
+
+  /// Default **false**, and this is the single biggest latency decision here.
+  ///
+  /// A cursor painted into the captured picture inherits the whole media
+  /// pipeline: capture → encode → network → decode → render. On a LAN that is
+  /// 80–150 ms, over a relay it can pass half a second — and the user reads all
+  /// of it as "the mouse is laggy", even though the injected event itself
+  /// arrived in microseconds. The controller draws its own cursor at the local
+  /// pointer position instead, so movement is immediate and only the *content*
+  /// behind it lags.
   final bool showCursor;
 
   CaptureRequest copyWith({String? sourceId, int? width, int? height, int? frameRate, bool? showCursor}) {

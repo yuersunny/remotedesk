@@ -97,6 +97,7 @@ class _SessionViewState extends State<SessionView> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     HardwareKeyboard.instance.removeHandler(_onGlobalKey);
     _releaseAll();
+    _cursor.dispose();
     _focusNode.dispose();
     super.dispose();
   }
@@ -122,6 +123,17 @@ class _SessionViewState extends State<SessionView> with WidgetsBindingObserver {
 
   /// Last pointer position in picture coordinates, for synthetic releases.
   Offset? _lastNormalised;
+
+  /// Where to paint the local cursor, in this widget's coordinates.
+  ///
+  /// A [ValueNotifier] rather than `setState`: the pointer moves dozens of times
+  /// a second, and rebuilding the subtree that hosts `RTCVideoView` at that rate
+  /// is pure waste. Only the small cursor layer listens.
+  final ValueNotifier<Offset?> _cursor = ValueNotifier<Offset?>(null);
+
+  void _trackCursor(Offset local) {
+    if (_cursor.value != local) _cursor.value = local;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -254,13 +266,22 @@ class _SessionViewState extends State<SessionView> with WidgetsBindingObserver {
           // observer, because losing widget focus no longer means the user
           // stopped typing at the remote machine.
           child: Listener(
-            onPointerHover: (event) => _sendMove(fit, event.localPosition),
-            onPointerMove: (event) => _sendMove(
-              fit,
-              event.localPosition,
-              dragging: _pressedButtons.isNotEmpty,
-            ),
-            onPointerDown: (event) => _sendButton(fit, event, pressed: true),
+            onPointerHover: (event) {
+              _trackCursor(event.localPosition);
+              _sendMove(fit, event.localPosition);
+            },
+            onPointerMove: (event) {
+              _trackCursor(event.localPosition);
+              _sendMove(
+                fit,
+                event.localPosition,
+                dragging: _pressedButtons.isNotEmpty,
+              );
+            },
+            onPointerDown: (event) {
+              _trackCursor(event.localPosition);
+              _sendButton(fit, event, pressed: true);
+            },
             onPointerUp: (event) => _sendButton(fit, event, pressed: false),
             onPointerCancel: (event) => _releaseAll(),
             onPointerSignal: _onPointerSignal,
@@ -314,6 +335,35 @@ class _SessionViewState extends State<SessionView> with WidgetsBindingObserver {
                           icon: Icons.mouse,
                           label: '点击画面后可直接操作远端',
                           color: const Color(0xFF4ADE80),
+                        ),
+                      ),
+                    // The cursor is drawn here, not captured into the stream —
+                    // so it tracks the physical mouse with no network in
+                    // between. See CaptureRequest.showCursor.
+                    if (_canControl)
+                      Positioned.fill(
+                        child: IgnorePointer(
+                          child: ValueListenableBuilder<Offset?>(
+                            valueListenable: _cursor,
+                            builder: (context, position, _) {
+                              if (position == null || !fit.contains(position)) {
+                                return const SizedBox.expand();
+                              }
+                              return Stack(
+                                children: [
+                                  Positioned(
+                                    left: position.dx - 1,
+                                    top: position.dy - 1,
+                                    child: const SizedBox(
+                                      width: 20,
+                                      height: 22,
+                                      child: CustomPaint(painter: _CursorPainter()),
+                                    ),
+                                  ),
+                                ],
+                              );
+                            },
+                          ),
                         ),
                       ),
                   ],
@@ -598,4 +648,41 @@ class _SessionViewState extends State<SessionView> with WidgetsBindingObserver {
       ),
     );
   }
+}
+
+/// A plain arrow pointer: white fill with a dark outline, so it stays visible
+/// on both a white document and a dark terminal.
+///
+/// Hand-drawn rather than an icon font glyph because the glyph's own padding
+/// would offset the hotspot: the tip has to sit exactly at the pointer position,
+/// otherwise clicks land a few pixels away from where the user aimed.
+class _CursorPainter extends CustomPainter {
+  const _CursorPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final s = size.height / 22.0;
+    final path = Path()
+      ..moveTo(0, 0)
+      ..lineTo(0, 16 * s)
+      ..lineTo(3.6 * s, 12.4 * s)
+      ..lineTo(6.2 * s, 18.6 * s)
+      ..lineTo(8.6 * s, 17.6 * s)
+      ..lineTo(6.1 * s, 11.4 * s)
+      ..lineTo(10.6 * s, 11.4 * s)
+      ..close();
+
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = const Color(0xCC000000)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.6 * s
+        ..strokeJoin = StrokeJoin.round,
+    );
+    canvas.drawPath(path, Paint()..color = Colors.white);
+  }
+
+  @override
+  bool shouldRepaint(covariant _CursorPainter oldDelegate) => false;
 }

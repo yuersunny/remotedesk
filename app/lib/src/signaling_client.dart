@@ -30,7 +30,19 @@ class SignalingClient {
 
     final channel = WebSocketChannel.connect(Uri.parse(url));
     _channel = channel;
-    await channel.ready;
+    try {
+      // Without this the call hangs for the OS TCP timeout (~75 s) and the UI
+      // shows nothing at all in the meantime — indistinguishable from a freeze.
+      // Eight seconds is generous for a LAN or a tailnet and short enough that
+      // a wrong address announces itself.
+      await channel.ready.timeout(const Duration(seconds: 8));
+    } on TimeoutException {
+      _channel = null;
+      try {
+        await channel.sink.close();
+      } catch (_) {}
+      throw TimeoutException('连接 $url 超时（8 秒内没有握手），检查地址与服务器是否在运行');
+    }
 
     _sub = channel.stream.listen(
       _onData,

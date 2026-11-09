@@ -25,6 +25,13 @@ enum SessionPhase { idle, preparing, negotiating, connecting, live, closed, fail
 /// Label of the DataChannel that carries input events (M2).
 const String kInputChannelLabel = 'input';
 
+/// Label of the movement-only channel (unordered, disposable frames).
+///
+/// Kept separate from [kInputChannelLabel] on purpose; see `InputChannel._moveDc`
+/// for why. A peer that does not recognise the label simply ignores it and moves
+/// keep flowing over the reliable channel.
+const String kMoveChannelLabel = 'move';
+
 extension SessionPhaseLabel on SessionPhase {
   String get label => switch (this) {
         SessionPhase.idle => '未开始',
@@ -155,7 +162,11 @@ class RtcSession {
     // control on an older build.
     pc.onDataChannel = (channel) {
       _log('收到数据通道: ${channel.label}');
-      if (channel.label == kInputChannelLabel) input.attach(channel);
+      if (channel.label == kInputChannelLabel) {
+        input.attach(channel);
+      } else if (channel.label == kMoveChannelLabel) {
+        input.attachMove(channel);
+      }
     };
 
     pc.onIceCandidate = (candidate) {
@@ -242,6 +253,26 @@ class RtcSession {
       _log('已创建输入通道');
     } catch (e) {
       _log('创建输入通道失败: $e');
+    }
+
+    // Movement channel: unordered, and frames that are not through within 30 ms
+    // are abandoned rather than retransmitted. The library only forwards
+    // `maxRetransmits`/`maxRetransmitTime` when positive (see
+    // RTCDataChannelInit.toMap), so "no retransmit at all" is not expressible —
+    // 30 ms is the closest behaviour and far below a perceptible stall.
+    //
+    // Failure here is not fatal: moves then ride the reliable channel above.
+    try {
+      final move = await pc.createDataChannel(
+        kMoveChannelLabel,
+        RTCDataChannelInit()
+          ..ordered = false
+          ..maxRetransmitTime = 30,
+      );
+      input.attachMove(move);
+      _log('已创建移动通道（无序，超时丢弃）');
+    } catch (e) {
+      _log('创建移动通道失败，鼠标移动将走可靠通道: $e');
     }
   }
 
