@@ -12,6 +12,16 @@ class LocalSignalingServer {
   int get port => 0;
   int get deviceCount => 0;
 
+  /// Declared for parity with the desktop build, which answers `/info` with
+  /// this so discovery can turn an address into a name.
+  String selfId = '';
+  String selfName = '';
+
+  void setIdentity({required String id, required String name}) {
+    selfId = id;
+    selfName = name;
+  }
+
   /// `false`, not an exception: "could not host here" is a normal outcome for
   /// a browser tab and the caller only ever branches on it.
   Future<bool> start({int port = 8787}) async {

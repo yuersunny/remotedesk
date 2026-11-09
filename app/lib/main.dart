@@ -12,7 +12,14 @@ import 'package:uuid/uuid.dart';
 // (the hardware-keyboard one), and this file needs both.
 import 'src/input_event.dart' as proto;
 import 'src/diag_log.dart';
+// Finds the other machine instead of asking the user for an address: the
+// tailnet's node list plus a UDP broadcast on the local network. A browser tab
+// can do neither, hence the conditional import.
+import 'src/discovery_stub.dart'
+    if (dart.library.io) 'src/discovery_io.dart';
 import 'src/input_injector.dart';
+import 'src/pairing_code.dart';
+import 'src/peer_info.dart';
 import 'src/rtc_session.dart';
 import 'src/screen_capture.dart';
 import 'src/session_view.dart';
@@ -95,17 +102,66 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  static const _kServer = 'server_url';
+  static const _kRelayOverride = 'relay_url';
   static const _kDevice = 'device_id';
   static const _kUnattended = 'unattended';
   static const _kUnattendedPassword = 'unattended_password';
+  static const _kRecentPeers = 'recent_peers';
 
+  /// Signaling for the target side of a session: this app connected to its own
+  /// relay, waiting to be called.
   final SignalingClient _client = SignalingClient();
+
+  /// Signaling for the controller side: connected to *the other machine's*
+  /// relay, only while a session is being set up.
+  ///
+  /// Two connections instead of one is what removes the last piece of setup the
+  /// user had to reason about. A single shared relay meant "somebody has to run
+  /// the server"; with this, each machine relays for itself and dialling a peer
+  /// means joining *their* relay. Nobody has to be designated.
+  final SignalingClient _dial = SignalingClient();
+
   final ScreenCaptureService _capture = ScreenCaptureService();
 
   final TextEditingController _serverCtrl = TextEditingController(text: 'ws://127.0.0.1:8787/ws');
   final TextEditingController _deviceCtrl = TextEditingController();
   final TextEditingController _targetCtrl = TextEditingController();
+  final TextEditingController _pairCtrl = TextEditingController();
+
+  /// Finds peers over the tailnet and the local network.
+  late final PeerDiscovery _discovery =
+      PeerDiscovery(onLog: (message) => _log('[发现] $message'));
+
+  /// Machines found by the last scan.
+  List<PeerInfo> _foundPeers = const <PeerInfo>[];
+  bool _scanning = false;
+
+  /// Machines connected to successfully before, most recent first, stored as
+  /// pairing codes.
+  ///
+  /// Codes rather than plain hosts because a code also carries the password:
+  /// remembering the *machine* but not its password would mean retyping six
+  /// characters every time, which is the friction this change exists to remove.
+  List<String> _recentCodes = const <String>[];
+
+  /// Parsed view of [_recentCodes]. Cheap — at most a handful of entries.
+  List<PeerInfo> get _recentPeers => <PeerInfo>[
+        for (final raw in _recentCodes)
+          if (PairingCode.parse(raw) case final code? when code.id.isNotEmpty)
+            code.toPeer(),
+      ];
+
+  /// Address for the manual path, kept out of `_serverCtrl` so the override in
+  /// 高级设置 and a one-off manual connect cannot overwrite each other.
+  final TextEditingController _manualHostCtrl = TextEditingController();
+
+  /// Where the currently selected target lives.
+  ///
+  /// Dialling joins the *peer's* relay, so host and port have to travel with
+  /// the call. They come from the discovered list or a pairing code — never
+  /// from a field the user had to type an IP into.
+  String _targetHost = '';
+  int _targetPort = 8787;
 
   /// The relay, hosted by this app when no other server is configured.
   ///
@@ -115,20 +171,25 @@ class _HomePageState extends State<HomePage> {
   late final LocalSignalingServer _localServer =
       LocalSignalingServer(onLog: (message) => _log('[服务] $message'));
 
-  /// True once the port bound — i.e. other machines should be pointed here.
-  bool _hosting = false;
-
   /// What the *other* machine should type into 高级设置, e.g.
   /// `ws://100.101.102.103:8787/ws`. Empty while not hosting.
   String _peerServerUrl = '';
 
   StreamSubscription<Map<String, dynamic>>? _sub;
+  StreamSubscription<Map<String, dynamic>>? _dialSub;
   final List<String> _logs = <String>[];
 
   bool _connected = false;
   bool _busy = false;
   String? _selfId;
-  List<Map<String, String>> _peers = const <Map<String, String>>[];
+
+  /// Which signaling connection the live session belongs to.
+  ///
+  /// The target side runs on [_client] (our own relay); the controller side
+  /// runs on [_dial] (the peer's relay). Accept/reject/leave have to go back
+  /// out the connection the call came in on — sending them the other way is
+  /// silently ignored by the far server.
+  late SignalingClient _activeSignaling = _client;
 
   RtcSession? _session;
   SessionPhase _phase = SessionPhase.idle;
@@ -201,7 +262,8 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    _sub = _client.events.listen(_onEvent);
+    _sub = _client.events.listen((m) => _onEvent(m, from: _client));
+    _dialSub = _dial.events.listen((m) => _onEvent(m, from: _dial));
     // Not `unawaited`: a startup failure has to be visible in the log with a
     // reason, not silently leave the app sitting there unconnected.
     _bootstrap().catchError((Object error, StackTrace stack) {
@@ -228,17 +290,30 @@ class _HomePageState extends State<HomePage> {
     final urlServer = query['server'];
     final urlPeer = query['peer'];
 
-    var deviceId = urlId ?? prefs.getString(_kDevice) ?? const Uuid().v4().substring(0, 8);
-    if (urlId == null) {
+    // The device name is what the other person sees and types, so it comes from
+    // the machine's own name rather than a random string. `mac-mini` is
+    // recognisable; `85262df3` is not, and a random id is also what made two
+    // machines collide after someone copied a config.
+    var deviceId = urlId ?? prefs.getString(_kDevice) ?? '';
+    if (deviceId.isEmpty) {
+      // Comes from the tailnet name (`mac-mini`) or the hostname, so the other
+      // person sees something they recognise instead of `85262df3`.
+      deviceId = await suggestedDeviceName();
+      if (deviceId.isEmpty) deviceId = const Uuid().v4().substring(0, 8);
       await prefs.setString(_kDevice, deviceId);
-    } else {
-      deviceId = urlId;
     }
+
+    final recentCodes =
+        prefs.getStringList(_kRecentPeers) ?? const <String>[];
 
     if (!mounted) return;
     setState(() {
-      final savedServer = urlServer ?? prefs.getString(_kServer);
-      if (savedServer != null && savedServer.isNotEmpty) _serverCtrl.text = savedServer;
+      // Only an explicit override is restored. The old `server_url` preference
+      // held "the one server everybody shares", which is exactly the concept
+      // this change removes — carrying it forward would keep pointing at a
+      // machine that may no longer relay for anyone.
+      final saved = urlServer ?? prefs.getString(_kRelayOverride);
+      if (saved != null && saved.isNotEmpty) _serverCtrl.text = saved;
       _deviceCtrl.text = deviceId;
       if (urlPeer != null && urlPeer.isNotEmpty) _targetCtrl.text = urlPeer;
       _autoJoin = query['autojoin'] == '1';
@@ -248,6 +323,7 @@ class _HomePageState extends State<HomePage> {
       _unattended = prefs.getBool(_kUnattended) ?? false;
       _unattendedPassword = prefs.getString(_kUnattendedPassword) ?? '';
       _unattendedPassCtrl.text = _unattendedPassword;
+      _recentCodes = recentCodes;
     });
     _log('本机设备ID: $deviceId');
     _log(_iceServers.isEmpty
@@ -258,27 +334,93 @@ class _HomePageState extends State<HomePage> {
       _log('自检模式：自动连接（role=$_autoRole, fakeCapture=$_useFakeCapture）');
       await Future<void>.delayed(const Duration(milliseconds: 300));
     }
-    // Become the relay when nobody else is one.
+
+    // Every machine relays for itself.
     //
-    // The Node server needed a separate process plus something to keep it alive
-    // across reboots, and on this machine the login-item route could not even be
-    // verified — launchd refused to bootstrap it. The machine being controlled
-    // has the app running anyway, so letting the app listen costs nothing and
-    // removes the moving part that "connect from home tomorrow" depended on.
-    //
-    // Only when the saved address points at this machine or at nothing: if the
-    // user deliberately configured another host, two islands both reporting
-    // "online" on their own loopback would never see each other.
-    final configured = _serverCtrl.text.trim();
-    if (configured.isEmpty || _isLocalAddress(configured)) {
-      await _startHosting(quietWhenTaken: configured.isNotEmpty);
-    }
+    // This used to be conditional — "host only if no server was configured" —
+    // because two machines each on their own loopback became two islands that
+    // both reported "online" and could not see each other. The fix is not to
+    // designate one of them; it is to stop needing a shared relay at all. Each
+    // machine joins its own relay and waits to be called; dialling a peer means
+    // joining *that peer's* relay for the length of the handshake. Being
+    // reachable and reaching are then independent, and "who is the server" is
+    // no longer a question the user is asked.
+    await _startHosting(quietWhenTaken: true);
+
+    // Announce on the LAN and re-announce periodically, so the other side's
+    // scan finds us even if it starts later.
+    await _discovery.startResponder(selfId: deviceId);
+    _discovery.startAnnouncing();
 
     // Connect at launch either way. "Fill in a server address, then press 连接"
     // was a step users should never have had to think about — the address is
     // remembered, so being online from the first second is the only sensible
     // default. Failure is logged and leaves the app usable.
     await _connect();
+
+    // Look for the other machine without being asked. It is a background scan:
+    // if it finds nothing the list simply says so.
+    unawaited(_scanPeers());
+  }
+
+  /// Scan both channels and rebuild the list.
+  ///
+  /// Recently-used machines stay in the list even when the scan misses them:
+  /// "last connected yesterday" is a far better row than an empty screen that
+  /// reads as "the app is broken".
+  Future<void> _scanPeers() async {
+    if (_scanning) return;
+    setState(() => _scanning = true);
+    try {
+      final found = await _discovery.scan();
+      if (!mounted) return;
+      final selfId = _deviceCtrl.text.trim();
+      final live = found.where((p) => p.id != selfId).toList();
+      final liveIds = live.map((p) => p.id).toSet();
+      final remembered = _recentPeers
+          .where((p) => !liveIds.contains(p.id))
+          .map((p) => p.copyWith(online: false, source: PeerSource.remembered));
+      setState(() {
+        _foundPeers = mergePeers(
+          <PeerInfo>[...live, ...remembered],
+          recentIds: _recentPeerIds,
+        );
+      });
+      _log(live.isEmpty
+          ? '自动查找：没找到在线的电脑（对方要先打开 RemoteDesk）'
+          : '自动查找：找到 ${live.length} 台 — ${live.map((p) => p.displayName).join(', ')}');
+    } finally {
+      if (mounted) setState(() => _scanning = false);
+    }
+  }
+
+  Set<String> get _recentPeerIds =>
+      _recentPeers.map((p) => p.id).where((id) => id.isNotEmpty).toSet();
+
+  /// Remember a machine we successfully reached.
+  ///
+  /// Stores the password too, so the next connection is a single tap. If the far
+  /// side rotates its password this entry simply fails once and the user is
+  /// asked again — a stale password costs one prompt, not a wrong connection.
+  Future<void> _rememberPeer(PeerInfo peer, {String password = ''}) async {
+    if (peer.id.isEmpty) return;
+    final code = PairingCode(
+      host: peer.host,
+      port: peer.port,
+      id: peer.id,
+      password: password,
+    ).encode();
+    final next = <String>[
+      code,
+      ..._recentCodes.where((raw) {
+        final parsed = PairingCode.parse(raw);
+        return parsed == null || parsed.id != peer.id;
+      }),
+    ].take(6).toList();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_kRecentPeers, next);
+    if (!mounted) return;
+    setState(() => _recentCodes = next);
   }
 
   /// Bind the relay and remember what to tell the other machine.
@@ -287,30 +429,26 @@ class _HomePageState extends State<HomePage> {
     if (!ok) {
       // Normal: the Node server, or a second copy of this app, already serves.
       if (!quietWhenTaken) _log('端口 8787 已被占用，直接连它');
-      return;
+    } else {
+      final ips = await localIpv4Addresses();
+      final picked = pickPeerAddress(ips);
+      if (!mounted) return;
+      setState(() {
+        _peerServerUrl = picked == null ? '' : 'ws://$picked:8787/ws';
+      });
+      _log(picked == null
+          ? '本机可被连接（端口 8787）'
+          : '本机可被连接：$_peerServerUrl');
+      final others = ips.where((ip) => ip != picked).toList();
+      if (others.isNotEmpty) _log('本机其它可用地址: ${others.join(', ')}');
     }
-    final ips = await localIpv4Addresses();
-    final picked = pickPeerAddress(ips);
-    if (!mounted) return;
-    setState(() {
-      _hosting = true;
-      _peerServerUrl = picked == null ? '' : 'ws://$picked:8787/ws';
-    });
-    _log(picked == null
-        ? '本机已作为信令服务器（端口 8787）'
-        : '本机已作为信令服务器（端口 8787），对方要填 $_peerServerUrl');
-    final others = ips.where((ip) => ip != picked).toList();
-    if (others.isNotEmpty) _log('本机其它可用地址: ${others.join(', ')}');
-  }
-
-  /// Is this URL aimed at the machine we are running on?
-  static bool _isLocalAddress(String url) {
-    final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
-    return host == '127.0.0.1' ||
-        host == 'localhost' ||
-        host == '::1' ||
-        host == '0.0.0.0' ||
-        host.isEmpty;
+    // Advertised by `/info` so a scanning peer sees a name instead of an IP.
+    // Set even when the port was taken: in that case the relay is someone
+    // else's, but this machine's identity is still this machine's.
+    _localServer.setIdentity(
+      id: _deviceCtrl.text.trim(),
+      name: _deviceCtrl.text.trim(),
+    );
   }
 
   @override
@@ -318,15 +456,19 @@ class _HomePageState extends State<HomePage> {
     _statsTimer?.cancel();
     _inputSub?.cancel();
     _sub?.cancel();
+    _dialSub?.cancel();
     _session?.close();
     _injector.dispose();
     _client.dispose();
+    _dial.dispose();
     // Release the port: a relaunch should be able to take it back immediately
     // rather than trip over the socket the previous instance left behind.
     unawaited(_localServer.stop());
+    unawaited(_discovery.stop());
     _serverCtrl.dispose();
     _deviceCtrl.dispose();
     _targetCtrl.dispose();
+    _pairCtrl.dispose();
     super.dispose();
   }
 
@@ -358,12 +500,24 @@ class _HomePageState extends State<HomePage> {
 
   // ---------------------------------------------------------------- signaling
 
-  Future<void> _onEvent(Map<String, dynamic> m) async {
+  /// [from] is the connection the frame arrived on. Two exist now — ours
+  /// (waiting to be called) and the peer's (while we dial out) — and replies
+  /// have to go back out the same one.
+  Future<void> _onEvent(
+    Map<String, dynamic> m, {
+    required SignalingClient from,
+  }) async {
     switch (m['type']) {
       case 'transport_open':
-        _log('信令通道已打开');
+        _log(from == _dial ? '已连上对方的服务' : '信令通道已打开');
         break;
       case 'registered':
+        if (from == _dial) {
+          // Registering on a peer's relay is a step in dialling, not "we are
+          // online" — the online chip belongs to our own relay.
+          _log('已在对方的服务上登记（临时）');
+          break;
+        }
         setState(() {
           _selfId = m['id'] as String?;
           _connected = true;
@@ -377,17 +531,17 @@ class _HomePageState extends State<HomePage> {
         }
         break;
       case 'devices':
-        final list = (m['devices'] as List)
-            .map((e) => <String, String>{
-                  'id': '${e['id']}',
-                  'name': '${e['name'] ?? ''}',
-                })
-            .toList();
-        setState(() => _peers = list);
-        _log('在线设备: ${list.isEmpty ? '(无)' : list.map((e) => e['id']).join(', ')}');
+        final ids = <String>[
+          for (final e in (m['devices'] as List)) '${e['id']}',
+        ];
+        // Informational only now: the visible list comes from discovery, not
+        // from whoever happens to share this machine's relay.
+        _log('本机中转上的设备: ${ids.isEmpty ? '(无)' : ids.join(', ')}');
         break;
       case 'incoming':
-        _log('收到呼叫 from=${m['from']}');
+        // Always arrives on our own relay: the caller joined it to reach us.
+        _activeSignaling = from;
+        _log('收到呼叫 from=${_prettyPeerId('${m['from']}')}');
         if (_autoJoin && _autoRole == 'target') {
           _acceptAndShare('${m['from']}');
         } else {
@@ -395,11 +549,14 @@ class _HomePageState extends State<HomePage> {
         }
         break;
       case 'accepted':
-        _log('对方已接受 from=${m['from']}');
-        await _startController('${m['from']}');
+        // Always arrives on the peer's relay: we joined it to reach them.
+        _activeSignaling = from;
+        _log('对方已接受 from=${_prettyPeerId('${m['from']}')}');
+        await _startController('${m['from']}', from);
         break;
       case 'rejected':
-        _log('对方拒绝 from=${m['from']}');
+        _log('对方拒绝 from=${_prettyPeerId('${m['from']}')}');
+        if (mounted) setState(() => _busy = false);
         break;
       case 'offer':
       case 'answer':
@@ -422,11 +579,11 @@ class _HomePageState extends State<HomePage> {
         setState(() => _busy = false);
         break;
       case 'transport_closed':
-        setState(() => _connected = false);
-        _log('信令通道已关闭');
+        if (from == _client) setState(() => _connected = false);
+        _log(from == _dial ? '对方的服务已断开' : '信令通道已关闭');
         break;
       case 'transport_error':
-        setState(() => _connected = false);
+        if (from == _client) setState(() => _connected = false);
         _log('通道错误: ${m['error']}');
         break;
       default:
@@ -438,14 +595,15 @@ class _HomePageState extends State<HomePage> {
     // Guarded: the launch path connects automatically, and the reconnect button
     // in 高级设置 goes through the same function.
     if (_connected) return;
-    final url = _serverCtrl.text.trim();
     final id = _deviceCtrl.text.trim();
-    if (url.isEmpty || id.isEmpty) {
-      _log('服务器地址或本机 ID 为空');
+    if (id.isEmpty) {
+      _log('本机设备 ID 为空');
       return;
     }
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_kServer, url);
+    // No address configured means "join my own relay" — that is now the normal
+    // case, not a fallback. An address is only ever an override.
+    final override = _serverCtrl.text.trim();
+    final url = override.isEmpty ? 'ws://127.0.0.1:8787/ws' : override;
     _log('正在连接 $url ...');
     try {
       await _client.connect(url: url, id: id, name: 'flutter-client');
@@ -454,31 +612,25 @@ class _HomePageState extends State<HomePage> {
       _log('连接失败: $e');
     }
 
-    // Fall back to a signaling server on this very machine.
-    //
-    // The saved address is often one that used to be right — another machine's
-    // tailnet IP, yesterday's LAN address — and a stale address is the single
-    // most common reason for "it just doesn't connect". When this machine
-    // happens to be running the server itself, that is a strictly better guess
-    // than leaving the app offline, and the switch is written to the log.
+    // An override pointing at a machine that no longer relays for us is the
+    // single most common way this used to end up "offline forever". Falling
+    // back to the local relay keeps the app reachable instead of dead.
     const local = 'ws://127.0.0.1:8787/ws';
     if (url == local) return;
-    _log('改用本机服务器再试一次…');
-    // Serve it here if nothing else does, so the app still comes up online
-    // instead of sitting dead on a stale address.
+    _log('改用本机端口再试一次…');
     if (!_localServer.running) {
       await _startHosting(quietWhenTaken: true);
       if (!_localServer.running) return;
-      _log('（注意：此时只有连到本机的设备互相可见；对方若连的是别的服务器，两边看不到彼此）');
     }
     try {
       await _client.connect(url: local, id: id, name: 'flutter-client');
       if (!mounted) return;
-      setState(() => _serverCtrl.text = local);
-      await prefs.setString(_kServer, local);
-      _log('已改用本机服务器 $local（地址已记住）');
+      setState(() => _serverCtrl.text = '');
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_kRelayOverride);
+      _log('已改回本机（那个地址上的服务没有响应）');
     } catch (e) {
-      _log('本机也没有可用的服务器: $e');
+      _log('本机也没有可用的服务: $e');
     }
   }
 
@@ -491,11 +643,15 @@ class _HomePageState extends State<HomePage> {
 
   // ------------------------------------------------------------------ session
 
-  Future<void> _startController(String peer) async {
+  Future<void> _startController(
+    String peer,
+    SignalingClient signaling,
+  ) async {
     await _teardownSession(notifyPeer: false);
+    _activeSignaling = signaling;
     final session = RtcSession(
       role: SessionRole.controller,
-      signaling: _client,
+      signaling: signaling,
       peerId: peer,
       iceServers: _iceServers,
       onLog: _log,
@@ -504,6 +660,7 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       _session = session;
       _phase = SessionPhase.negotiating;
+      _busy = false;
     });
     _bindSessionInput(session);
     try {
@@ -537,7 +694,7 @@ class _HomePageState extends State<HomePage> {
           : await _capture.capture(await _resolveCaptureRequest());
     } catch (e) {
       _log('屏幕采集被取消或失败: $e');
-      _client.reject(peer);
+      _activeSignaling.reject(peer);
       if (mounted) {
         setState(() => _busy = false);
       }
@@ -563,7 +720,7 @@ class _HomePageState extends State<HomePage> {
 
     final session = RtcSession(
       role: SessionRole.target,
-      signaling: _client,
+      signaling: _activeSignaling,
       peerId: peer,
       iceServers: _iceServers,
       targetScreen: injectorScreen,
@@ -578,8 +735,8 @@ class _HomePageState extends State<HomePage> {
     _bindSessionInput(session);
 
     // Accept only once we really have frames to send.
-    _client.accept(peer);
-    _log('已接受 $peer，开始共享屏幕');
+    _activeSignaling.accept(peer);
+    _log('已接受 ${_prettyPeerId(peer)}，开始共享屏幕');
 
     try {
       await session.start(localStream: stream);
@@ -663,17 +820,23 @@ class _HomePageState extends State<HomePage> {
     _remoteHello = null;
     final session = _session;
     if (session == null) return;
-    if (notifyPeer) _client.leave(session.peerId);
+    if (notifyPeer) _activeSignaling.leave(session.peerId);
     _session = null;
     _stats = SessionStats.empty;
     _phase = SessionPhase.idle;
     await session.close();
+    // The dial connection exists only for this session; keeping it open would
+    // leave a stale registration on a machine that may reboot or move.
+    if (_activeSignaling == _dial) {
+      await _dial.disconnect();
+      _activeSignaling = _client;
+    }
     if (mounted) setState(() {});
   }
 
   Future<void> _hangUp() async {
     final peer = _session?.peerId ?? _targetCtrl.text.trim();
-    if (peer.isNotEmpty) _client.leave(peer);
+    if (peer.isNotEmpty) _activeSignaling.leave(peer);
     await _teardownSession(notifyPeer: false);
     _log('已结束会话');
   }
@@ -681,12 +844,121 @@ class _HomePageState extends State<HomePage> {
   Future<void> _call() async {
     final to = _targetCtrl.text.trim();
     if (to.isEmpty) {
-      _log('请填写目标设备ID');
+      _log('请选择一个要连接的设备');
       return;
     }
     final password = _passCtrl.text;
-    _client.connectTo(to, password: password.isEmpty ? null : password);
-    _log('已请求连接 $to${password.isEmpty ? '' : '（带访问口令）'}');
+    // Dialling means joining the peer's relay, so the target's address has to
+    // travel with the call. It comes from the list (or the pairing code), never
+    // from a field the user had to fill with an IP.
+    final host = _targetHost.trim();
+    if (host.isEmpty) {
+      _log('不知道该连哪台机器的地址 — 请从列表里选，或用配对码');
+      return;
+    }
+    setState(() => _busy = true);
+    final callerId = _callerId();
+    try {
+      await _dial.connect(
+        url: 'ws://$host:$_targetPort/ws',
+        id: callerId,
+        name: _deviceCtrl.text.trim(),
+      );
+    } catch (e) {
+      _log('连不上 $host —— $e');
+      if (mounted) setState(() => _busy = false);
+      return;
+    }
+    _activeSignaling = _dial;
+    _dial.connectTo(to, password: password.isEmpty ? null : password);
+    _log('已请求连接 ${_prettyPeerId(to)}${password.isEmpty ? '' : '（带访问口令）'}');
+
+    // A call that is accepted by the relay but never answered — the far side is
+    // up, its window is behind something, nobody is at the keyboard — would
+    // otherwise leave the button disabled forever with no explanation. Fifteen
+    // seconds is past the point where a person has decided it is stuck.
+    Timer(const Duration(seconds: 15), () {
+      if (!mounted || !_busy || _session != null) return;
+      setState(() => _busy = false);
+      _log('${_prettyPeerId(to)} 15 秒没有回应 —— 可能窗口弹在对方看不到的地方；'
+          '对端开着「允许远程控制」时会自动接受，没开就需要有人在那边点一下');
+    });
+  }
+
+  /// The id we register under on someone else's relay.
+  ///
+  /// It must differ from the id we use on our own relay, or the far server sees
+  /// two devices with the same id and rejects the second — which shows up as
+  /// "the other machine refuses me" with no useful message. The suffix is
+  /// stripped again when displaying it.
+  String _callerId() {
+    final base = _deviceCtrl.text.trim();
+    return base.isEmpty ? 'caller' : '$base-ctl';
+  }
+
+  /// Turn `mac-mini-ctl` back into `mac-mini` for anything a person reads.
+  static String _prettyPeerId(String id) =>
+      id.endsWith('-ctl') ? id.substring(0, id.length - 4) : id;
+
+  /// Dial a peer picked from the list (or a remembered one).
+  Future<void> _dialTo(PeerInfo peer, {String? password}) async {
+    if (_busy || _session != null) return;
+    setState(() {
+      _targetCtrl.text = peer.id;
+      _targetHost = peer.host;
+      _targetPort = peer.port;
+      if (password != null) _passCtrl.text = password;
+    });
+    await _rememberPeer(peer, password: password ?? '');
+    await _call();
+  }
+
+  /// Dial from a pasted pairing code.
+  ///
+  /// One field instead of three: the code carries address, id and password, so
+  /// the person who pastes it never has to know which machine is relaying.
+  Future<void> _connectByCode() async {
+    final raw = _pairCtrl.text.trim();
+    final code = PairingCode.parse(raw);
+    if (code == null) {
+      _log('这行字里没有可用的地址 — 让对方重新复制一次配对码');
+      return;
+    }
+    if (code.id.isEmpty) {
+      _log('这行字里只有地址，还缺设备 ID');
+      return;
+    }
+    _log('配对码：连 ${code.id} @ ${code.host}:${code.port}');
+    setState(() {
+      _pairCtrl.clear();
+      _targetCtrl.text = code.id;
+      _targetHost = code.host;
+      _targetPort = code.port;
+      if (code.password.isNotEmpty) _passCtrl.text = code.password;
+    });
+    await _dialTo(
+      PeerInfo(
+        id: code.id,
+        host: code.host,
+        port: code.port,
+        name: code.id,
+        source: PeerSource.manual,
+      ),
+      password: code.password,
+    );
+  }
+
+  /// This machine's own code, for the other person to paste. Empty until the
+  /// relay address is known — a code without an address is worse than none.
+  String get _myPairingCode {
+    final host = Uri.tryParse(_peerServerUrl)?.host ?? '';
+    final id = _deviceCtrl.text.trim();
+    if (host.isEmpty || id.isEmpty) return '';
+    return PairingCode(
+      host: host,
+      id: id,
+      password: _unattendedPassword,
+    ).encode();
   }
 
   /// Decide what to do with an inbound call.
@@ -707,19 +979,19 @@ class _HomePageState extends State<HomePage> {
       // Switched on without a password: refuse rather than hand the machine to
       // anyone who can reach the signaling server.
       _log('⚠ 无人值守已开启但没有设置口令，拒绝 $from');
-      _client.reject(from);
+      _activeSignaling.reject(from);
       return;
     }
 
     final offered = (m['password'] as String?) ?? '';
     if (offered.isEmpty) {
       _log('⚠ 无人值守：$from 未提供口令，已拒绝');
-      _client.reject(from);
+      _activeSignaling.reject(from);
       return;
     }
     if (!_constantTimeEquals(offered, _unattendedPassword)) {
       _log('⚠ 无人值守：$from 口令错误，已拒绝');
-      _client.reject(from);
+      _activeSignaling.reject(from);
       return;
     }
 
@@ -753,7 +1025,7 @@ class _HomePageState extends State<HomePage> {
           TextButton(
             onPressed: () {
               Navigator.pop(ctx);
-              _client.reject(from);
+              _activeSignaling.reject(from);
               _log('已拒绝 $from');
             },
             child: const Text('拒绝'),
@@ -845,13 +1117,13 @@ class _HomePageState extends State<HomePage> {
     final value = await showDialog<String>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('修改本机 ID'),
+        title: const Text('给这台电脑改个名字'),
         content: TextField(
           controller: controller,
           autofocus: true,
           decoration: const InputDecoration(
-            labelText: '本机 ID',
-            helperText: '对方用这个 ID 连你。建议用字母数字，不要空格',
+            labelText: '名字',
+            helperText: '对方在列表里看到的就是它。用字母数字，别和另一台重名',
           ),
           onSubmitted: (text) => Navigator.pop(context, text.trim()),
         ),
@@ -872,12 +1144,18 @@ class _HomePageState extends State<HomePage> {
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_kDevice, value);
-    // Must re-register: the server keys devices by this ID.
+    // Must re-register: the relay keys devices by this id, and discovery
+    // advertises it. A stale id here makes the machine appear twice — once
+    // under the old name in the other side's recent list, once under the new.
     await _disconnect();
     if (!mounted) return;
     setState(() => _deviceCtrl.text = value);
+    _localServer.setIdentity(id: value, name: value);
+    await _discovery.stop();
+    await _discovery.startResponder(selfId: value);
+    _discovery.startAnnouncing();
     await _connect();
-    _log('本机 ID 已改为 $value');
+    _log('本机名字已改为 $value');
   }
 
   /// Turn a signaling error code into something a person can act on.
@@ -1085,8 +1363,12 @@ class _HomePageState extends State<HomePage> {
           const SizedBox(width: 10),
           Expanded(
             child: Text(
-              '还没连上信令服务器（${_serverCtrl.text}）。\n'
-              '两台机器要填同一个地址 —— 填运行服务器那台的地址，末尾的 /ws 别漏。',
+              _serverCtrl.text.trim().isEmpty
+                  ? '本机的中转服务没起来（端口 8787）。\n'
+                      '通常是有另一份程序或旧的 node 服务占着这个端口。'
+                      '不影响被连接，但对方可能找不到你。'
+                  : '连不上 ${_serverCtrl.text.trim()}。\n'
+                      '这是你在「高级」里手工指定的地址 —— 清空它就会改回本机。',
               style: theme.textTheme.bodySmall?.copyWith(
                 color: theme.colorScheme.onErrorContainer,
                 height: 1.5,
@@ -1110,9 +1392,9 @@ class _HomePageState extends State<HomePage> {
     final open = _unattended;
     final idStyle = theme.textTheme.headlineSmall?.copyWith(
       fontWeight: FontWeight.w600,
-      letterSpacing: 2,
       color: theme.colorScheme.onSurface,
     );
+    final code = _myPairingCode;
 
     return Card(
       margin: EdgeInsets.zero,
@@ -1137,7 +1419,7 @@ class _HomePageState extends State<HomePage> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        '本机 ID',
+                        '这台电脑的名字（对方选它就能连）',
                         style: theme.textTheme.labelSmall
                             ?.copyWith(color: theme.colorScheme.outline),
                       ),
@@ -1147,45 +1429,62 @@ class _HomePageState extends State<HomePage> {
                   ),
                 ),
                 IconButton(
-                  onPressed: () => _copyToClipboard('本机 ID', selfId),
+                  onPressed: () => _copyToClipboard('本机名称', selfId),
                   icon: const Icon(Icons.copy, size: 18),
-                  tooltip: '复制 ID',
+                  tooltip: '复制名字',
                 ),
                 IconButton(
                   onPressed: _editDeviceId,
                   icon: const Icon(Icons.edit_outlined, size: 18),
-                  tooltip: '改 ID',
+                  tooltip: '改名',
                 ),
               ],
             ),
-            // Only when we are the server: this is the one string the other
-            // machine needs beyond the ID and password. Buried in 高级设置 it is
-            // the step people skip, and skipping it is what produces "连不上".
-            if (_hosting && _peerServerUrl.isNotEmpty) ...[
-              const SizedBox(height: 4),
+            // The escape hatch, in one line.
+            //
+            // Auto-discovery covers the normal case; this is for the case it
+            // cannot — a network that blocks broadcasts and has no tailnet, or
+            // handing access to someone outside both. It replaces the old
+            // "对方服务器填 ws://…" line: that one leaked the relay concept and
+            // still left the password to be typed separately.
+            if (code.isNotEmpty) ...[
+              const SizedBox(height: 8),
               InkWell(
                 borderRadius: BorderRadius.circular(6),
-                onTap: () => _copyToClipboard('服务器地址', _peerServerUrl),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 2),
+                onTap: () => _copyToClipboard('配对码', code),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(6),
+                  ),
                   child: Row(
                     children: [
-                      Icon(Icons.dns_outlined,
-                          size: 14, color: theme.colorScheme.outline),
-                      const SizedBox(width: 6),
+                      Icon(Icons.qr_code_2,
+                          size: 15, color: theme.colorScheme.primary),
+                      const SizedBox(width: 7),
                       Expanded(
                         child: Text(
-                          '对方服务器填 $_peerServerUrl',
+                          code,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: theme.textTheme.bodySmall?.copyWith(
-                            color: theme.colorScheme.outline,
+                            fontFamily: 'monospace',
+                            color: theme.colorScheme.onSurface,
                           ),
                         ),
                       ),
                       Icon(Icons.copy,
-                          size: 14, color: theme.colorScheme.outline),
+                          size: 14, color: theme.colorScheme.primary),
                     ],
                   ),
                 ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '上面这行字包含名字、密码和地址，对方粘一下就能连。点一下即复制。',
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: theme.colorScheme.outline, height: 1.4),
               ),
             ],
             const Divider(height: 20),
@@ -1260,7 +1559,13 @@ class _HomePageState extends State<HomePage> {
   }
 
   /// "Connect to another computer": two fields and one button.
+  /// "Connect to another computer": a list you tap, or one line you paste.
+  ///
+  /// There is deliberately no address field on this path. Which machine relays
+  /// the handshake is an implementation detail; asking the user to decide it
+  /// was the reason this screen used to need a paragraph of explanation.
   Widget _connectCard(ThemeData theme) {
+    final busy = _busy || _session != null;
     return Card(
       margin: EdgeInsets.zero,
       child: Padding(
@@ -1268,45 +1573,279 @@ class _HomePageState extends State<HomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text('连接另一台电脑', style: theme.textTheme.titleSmall),
-            const SizedBox(height: 10),
             Row(
               children: [
-                Expanded(flex: 5, child: _field(_targetCtrl, '对方 ID')),
-                const SizedBox(width: 8),
+                Text('连接另一台电脑', style: theme.textTheme.titleSmall),
+                const Spacer(),
+                if (_scanning)
+                  const SizedBox(
+                    width: 13,
+                    height: 13,
+                    child: CircularProgressIndicator(strokeWidth: 1.8),
+                  )
+                else
+                  IconButton(
+                    onPressed: busy ? null : _scanPeers,
+                    icon: const Icon(Icons.refresh, size: 17),
+                    tooltip: '重新查找',
+                    visualDensity: VisualDensity.compact,
+                  ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            if (_foundPeers.isEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                child: Text(
+                  _scanning
+                      ? '正在查找…'
+                      : '还没找到。让另一台电脑先打开 RemoteDesk，'
+                          '两台在同一个 Wi-Fi 或同一个 Tailscale 网络里就会自动出现。',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.outline,
+                    height: 1.45,
+                  ),
+                ),
+              )
+            else
+              for (final peer in _foundPeers.take(6))
+                _peerRow(theme, peer, busy: busy),
+            const SizedBox(height: 10),
+            // Pasting a line covers what discovery cannot: no shared network,
+            // no tailnet, or handing access to someone outside both.
+            Row(
+              children: [
                 Expanded(
-                  flex: 5,
-                  child: _field(_passCtrl, '对方密码', obscure: true),
+                  child: _field(
+                    _pairCtrl,
+                    '或者粘贴对方给你的配对码',
+                    onSubmitted: (_) => _connectByCode(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                SizedBox(
+                  height: 40,
+                  child: FilledButton.tonal(
+                    onPressed: busy ? null : _connectByCode,
+                    child: const Text('连'),
+                  ),
                 ),
               ],
             ),
-            if (_peers.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 6,
-                runSpacing: 4,
+            const SizedBox(height: 6),
+            _manualConnectToggle(theme, busy: busy),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// One row: name, where it was found, and a tap target that dials it.
+  Widget _peerRow(ThemeData theme, PeerInfo peer, {required bool busy}) {
+    final offline = !peer.online;
+    final isRecent = _recentPeerIds.contains(peer.id) && peer.id.isNotEmpty;
+    final meta = <String>[
+      if (isRecent) '上次连过',
+      peer.sourceLabel,
+      peer.host,
+    ].join(' · ');
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: busy ? null : () => _connectToPeer(peer),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 2),
+        child: Row(
+          children: [
+            Icon(
+              peer.platform.contains('win')
+                  ? Icons.desktop_windows_outlined
+                  : Icons.desktop_mac_outlined,
+              size: 18,
+              color: offline
+                  ? theme.colorScheme.outline
+                  : theme.colorScheme.primary,
+            ),
+            const SizedBox(width: 9),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  for (final peer in _peers)
-                    ActionChip(
-                      label: Text(peer['id']!),
-                      onPressed: () =>
-                          setState(() => _targetCtrl.text = peer['id']!),
+                  Text(
+                    peer.displayName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                      color: offline
+                          ? theme.colorScheme.outline
+                          : theme.colorScheme.onSurface,
                     ),
+                  ),
+                  const SizedBox(height: 1),
+                  Text(
+                    offline ? '$meta · 现在没连上' : meta,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelSmall
+                        ?.copyWith(color: theme.colorScheme.outline),
+                  ),
                 ],
               ),
-            ],
-            const SizedBox(height: 10),
-            SizedBox(
-              height: 44,
-              child: FilledButton.icon(
-                onPressed: _connected && _session == null && !_busy ? _call : null,
-                icon: const Icon(Icons.desktop_windows_outlined),
-                label: const Text('连接'),
-              ),
+            ),
+            Icon(
+              Icons.chevron_right,
+              size: 18,
+              color: theme.colorScheme.outline,
             ),
           ],
         ),
       ),
+    );
+  }
+
+  /// Tap a peer: connect, asking for a password only when we do not have one.
+  ///
+  /// The password is remembered after the first success, so the second time is
+  /// one tap and nothing else. Without that, unattended mode would mean typing
+  /// six characters on every single connection — which is precisely the kind of
+  /// friction this whole change is about.
+  Future<void> _connectToPeer(PeerInfo peer) async {
+    if (_busy || _session != null) return;
+    var password = _passwordFor(peer);
+    if (password == null) {
+      final typed = await _askPassword(peer);
+      if (typed == null) return;
+      password = typed;
+    }
+    await _dialTo(peer, password: password);
+  }
+
+  /// Cached password for a peer, or null when we have never connected to it.
+  ///
+  /// An empty string is a real answer: it means the far machine does not require
+  /// one, and the caller must not prompt.
+  String? _passwordFor(PeerInfo peer) {
+    for (final raw in _recentCodes) {
+      final code = PairingCode.parse(raw);
+      if (code != null && code.id == peer.id) return code.password;
+    }
+    return null;
+  }
+
+  Future<String?> _askPassword(PeerInfo peer) async {
+    final controller = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('连接 ${peer.displayName}'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '如果对方开着「允许远程控制」，输入它显示的连接密码。'
+              '如果没开，直接点连接 —— 对方屏幕上会弹出确认。',
+              style: Theme.of(ctx).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: '连接密码（可留空）',
+                isDense: true,
+              ),
+              onSubmitted: (v) => Navigator.pop(ctx, v),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text),
+            child: const Text('连接'),
+          ),
+        ],
+      ),
+    );
+    return result;
+  }
+
+  /// The escape hatch, collapsed. Only reachable by people who know they need
+  /// it — an address box on the main path is what this change removes.
+  Widget _manualConnectToggle(ThemeData theme, {required bool busy}) {
+    return Theme(
+      data: theme.copyWith(dividerColor: Colors.transparent),
+      child: ExpansionTile(
+        tilePadding: EdgeInsets.zero,
+        childrenPadding: const EdgeInsets.only(bottom: 4),
+        expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
+        title: Text(
+          '手动指定（找不到的时候用）',
+          style: theme.textTheme.bodySmall
+              ?.copyWith(color: theme.colorScheme.outline),
+        ),
+        children: [
+          Row(
+            children: [
+              Expanded(child: _field(_targetCtrl, '对方的名字')),
+              const SizedBox(width: 8),
+              Expanded(child: _field(_passCtrl, '密码', obscure: true)),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: _field(_manualHostCtrl, '对方地址（IP 或 ws://IP:8787/ws）'),
+              ),
+              const SizedBox(width: 8),
+              SizedBox(
+                height: 40,
+                child: FilledButton(
+                  onPressed: busy ? null : _connectManual,
+                  child: const Text('连接'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _connectManual() async {
+    final host = _manualHostCtrl.text.trim();
+    final id = _targetCtrl.text.trim();
+    if (id.isEmpty) {
+      _log('还差对方的名字（在对方那台的「这台电脑」卡片上）');
+      return;
+    }
+    if (host.isEmpty) {
+      final peer = _foundPeers.where((p) => p.id == id).firstOrNull;
+      if (peer == null) {
+        _log('还差对方地址 — 可以问对方要一行配对码，粘到上面的框里');
+        return;
+      }
+      await _dialTo(peer, password: _passCtrl.text);
+      return;
+    }
+    // Accept a bare IP, an IP with port, or a full ws:// URL — people paste all
+    // three, and rejecting two of them teaches nothing.
+    final parsed = PairingCode.parse('RDSK1 $host $id ${_passCtrl.text}') ??
+        PairingCode.parse(host);
+    if (parsed == null) {
+      _log('这个地址看不懂：$host');
+      return;
+    }
+    await _dialTo(
+      PeerInfo(id: id, host: parsed.host, port: parsed.port, name: id),
+      password: _passCtrl.text,
     );
   }
 
@@ -1328,14 +1867,20 @@ class _HomePageState extends State<HomePage> {
           childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
           title: Text('高级设置', style: theme.textTheme.titleSmall),
           subtitle: Text(
-            '服务器地址 · 画质 · 注入诊断',
+            '高级 · 一般不用动',
             style: theme.textTheme.bodySmall
                 ?.copyWith(color: theme.colorScheme.outline),
           ),
           children: [
             Row(
               children: [
-                Expanded(child: _field(_serverCtrl, '信令服务器 (ws://host:port/ws)')),
+                Expanded(
+                  child: _field(
+                    _serverCtrl,
+                    '改用自己的中转服务（留空=本机，一般不用填）',
+                    onSubmitted: (_) => _connect(),
+                  ),
+                ),
                 const SizedBox(width: 8),
                 IconButton(
                   onPressed: _connected ? _disconnect : _connect,
@@ -1575,11 +2120,13 @@ class _HomePageState extends State<HomePage> {
     String label, {
     bool obscure = false,
     ValueChanged<String>? onChanged,
+    ValueChanged<String>? onSubmitted,
   }) {
     return TextField(
       controller: controller,
       obscureText: obscure,
       onChanged: onChanged,
+      onSubmitted: onSubmitted,
       decoration: InputDecoration(
         labelText: label,
         border: const OutlineInputBorder(),

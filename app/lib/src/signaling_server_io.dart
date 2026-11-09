@@ -79,6 +79,23 @@ class LocalSignalingServer {
   int get port => _http?.port ?? 0;
   int get deviceCount => _devices.length;
 
+  /// Who this machine is, as answered by `/info`.
+  ///
+  /// Discovery probes `/info` instead of opening a WebSocket and issuing
+  /// `list`: the other side wants exactly one fact ("which device lives at this
+  /// address"), and a plain GET is an order of magnitude cheaper than a
+  /// register/list/leave dance per candidate address.
+  String selfId = '';
+  String selfName = '';
+
+  /// Keep the advertised identity in step with the UI. Called when the user
+  /// renames this machine — a stale name here makes discovery list the same
+  /// machine twice under two identities.
+  void setIdentity({required String id, required String name}) {
+    selfId = id;
+    selfName = name;
+  }
+
   /// Try to listen. Returns false when the port is taken — which normally means
   /// another instance (or the Node server) is already serving and this machine
   /// should just connect to it rather than racing for the port.
@@ -131,6 +148,29 @@ class LocalSignalingServer {
             ..write(jsonEncode(<String, Object?>{
               'ok': true,
               'devices': _devices.length,
+            }));
+          await request.response.close();
+          continue;
+        }
+
+        // What a scanning peer needs to turn an address into a row in the
+        // "找到的电脑" list. Deliberately unauthenticated and read-only: it
+        // carries no password and no device list, so an open port on a LAN
+        // gives away nothing that nmap would not.
+        if (request.uri.path == '/info') {
+          request.response
+            ..statusCode = HttpStatus.ok
+            ..headers.contentType = ContentType.json
+            // Discovery in a browser tab (the web build) cannot read this
+            // otherwise; the app builds do not care.
+            ..headers.set('Access-Control-Allow-Origin', '*')
+            ..write(jsonEncode(<String, Object?>{
+              'ok': true,
+              'app': 'remotedesk',
+              'id': selfId,
+              'name': selfName.isEmpty ? selfId : selfName,
+              'port': port,
+              'platform': Platform.operatingSystem,
             }));
           await request.response.close();
           continue;
