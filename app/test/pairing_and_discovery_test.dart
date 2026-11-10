@@ -44,7 +44,7 @@ void main() {
         'RDSK1 1.2.3.4:8787 win-pc 123456',
         'rdsk1 1.2.3.4:8787 win-pc 123456',
         '  RDSK1   1.2.3.4:8787     win-pc     123456  ',
-        'RDSK1\t1.2.3.4:8787\tyu\t123456',
+        'RDSK1\t1.2.3.4:8787\twin-pc\t123456',
       ]) {
         final code = PairingCode.parse(text)!;
         expect(code.host, '1.2.3.4', reason: text);

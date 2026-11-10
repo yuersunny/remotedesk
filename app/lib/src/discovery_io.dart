@@ -358,9 +358,9 @@ Future<String> _tailscaleSelfName() async {
 /// Reduce anything to a name that survives being typed, logged, and put in a
 /// URL: lowercase ASCII, no spaces, no dots.
 ///
-/// Non-ASCII is dropped rather than transliterated. `某人的Mac mini` — a real
-/// hostname on this machine — becomes `mac-mini`, which is what a person would
-/// have typed anyway.
+/// Non-ASCII is dropped rather than transliterated. A hostname such as
+/// `某人的Mac mini` becomes `mac-mini`, which is what a person would have typed
+/// anyway.
 String sanitizeDeviceName(String raw) {
   var value = raw.trim().toLowerCase();
   final dot = value.indexOf('.');

@@ -50,25 +50,23 @@ rsync -a \
   "$KIT/" "$OUT/installers/windows/"
 
 # ---- 3. 源码（带 .git，朋友能看历史、能直接接着改）--------------------------
-echo "==> 复制源码"
+# 只复制 **git 跟踪的文件**。以前用 rsync 复制整个工作目录，于是 .idea/ 这类被
+# .gitignore 忽略的东西也会跟着进包——IDE 配置里写着构建机的绝对路径和用户名。
+# 以 git 索引为准，被忽略的一律不可能漏进来。
+echo "==> 复制源码（仅 git 跟踪的文件）"
+cd "$ROOT"
+git ls-files -z | rsync -a --from0 --files-from=- ./ "$OUT/source/"
+# .git 一起带上（朋友能 git log 看这十几轮是怎么长出来的），去掉重写残留。
 rsync -a \
-  --exclude 'dist/' \
-  --exclude '.workbuddy/' \
-  --exclude '.DS_Store' \
-  --exclude 'app/build/' \
-  --exclude 'app/.dart_tool/' \
-  --exclude 'app/.flutter-plugins' \
-  --exclude 'app/.flutter-plugins-dependencies' \
-  --exclude 'app/macos/Pods/' \
-  --exclude 'app/macos/.symlinks/' \
-  --exclude 'app/macos/Flutter/ephemeral/' \
-  --exclude 'app/windows/flutter/ephemeral/' \
-  --exclude 'app/android/.gradle/' \
-  --exclude 'app/android/keystore/' \
-  --exclude 'app/android/key.properties' \
-  --exclude 'app/android/local.properties' \
-  --exclude 'node_modules/' \
-  "$ROOT/" "$OUT/source/"
+  --exclude 'hooks/' \
+  --exclude 'objects/info/commit-graph' \
+  "$ROOT/.git" "$OUT/source/.git"
+cd "$ROOT"
+
+# 工作区若有未提交改动，源码快照就不等于发行版，先拦住。
+if [ -n "$(git status --porcelain)" ]; then
+  echo "  [!] 工作区有未提交改动，source/ 是最后一次提交的状态" >&2
+fi
 
 # ---- 4. 交付说明 ------------------------------------------------------------
 cat > "$OUT/README-FIRST.txt" <<TXT
@@ -136,6 +134,41 @@ if [ -n "$LEAK" ]; then
   FAIL=1
 else
   echo "  [ok] 不含签名密钥"
+fi
+
+# 反证二：包内不能出现本机的身份痕迹。源码里有、文档里有、甚至只活在提交信息里
+# 的，都算泄漏——公开出去之前就该断掉。
+echo "==> 隐私自检"
+CHK="$(mktemp -d)"
+unzip -q "$ZIP" -d "$CHK"
+PRIV_HITS="$(grep -rIl --binary-files=without-match \
+  -E '7Q4WT9|100\.86\.168\.53|100\.108\.183\.61|某人|192\.168\.1\.123' \
+  "$CHK" 2>/dev/null | sed "s|$CHK/||" || true)"
+IDE_HITS="$(find "$CHK" -type d -name '.idea' -o -type f -name 'local.properties' 2>/dev/null \
+  | sed "s|$CHK/||" | head -5)"
+HIST_HITS="$(git -C "$CHK/RemoteDesk-$VERSION/source" log --all --format='%s%n%b' 2>/dev/null \
+  | grep -cE '7Q4WT9|100\.86\.168\.53|100\.108\.183\.61|某人' || true)"
+rm -rf "$CHK"
+
+if [ -n "$PRIV_HITS" ]; then
+  echo "  [!!] 包内出现本机隐私串：" >&2
+  echo "$PRIV_HITS" | sed 's/^/       /' >&2
+  FAIL=1
+else
+  echo "  [ok] 文本里无密码 / tailnet IP / 真名残留"
+fi
+if [ -n "$IDE_HITS" ]; then
+  echo "  [!!] 包里带了 IDE 配置或本机 SDK 路径：" >&2
+  echo "$IDE_HITS" | sed 's/^/       /' >&2
+  FAIL=1
+else
+  echo "  [ok] 不含 .idea / local.properties"
+fi
+if [ "${HIST_HITS:-0}" -gt 0 ]; then
+  echo "  [!!] git 提交信息里还有 $HIST_HITS 行敏感内容" >&2
+  FAIL=1
+else
+  echo "  [ok] git 历史干净"
 fi
 
 echo

@@ -47,3 +47,7 @@ dist/release/
 # 会退回 debug 签名。详见 app/android/key.properties。
 app/android/key.properties
 app/android/keystore/
+
+# 打包中间产物（pack-release.sh 解出来的目录）
+dist/release/
+dist/RemoteDesk-*/
