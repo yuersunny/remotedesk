@@ -56,6 +56,8 @@ dist/RemoteDesk-*/
 # 随 Release 分发。PDF 内嵌了字体子集（约 2MB），进版本库没有意义。
 dist/RemoteDesk-*-使用说明书.pdf
 dist/RemoteDesk-*-使用说明书.html
+# publish-github.sh 上传前复制的英文名副本（GitHub 资产名不支持非 ASCII）
+dist/RemoteDesk-*-manual-zh.pdf
 
 # 隐私黑名单：里面是要藏的值，只留在本机
 .privacy-blocklist
