@@ -16,3 +16,20 @@ bool get isHandheld =>
 
 /// True where the app can relay for itself, share its screen and inject input.
 bool get canHostScreen => !kIsWeb && !isHandheld;
+
+/// This machine's platform as it travels in the `hello` handshake.
+///
+/// A plain lowercase tag rather than [TargetPlatform]'s enum name, because the
+/// receiving side compares it against a fixed string and a renamed enum member
+/// should not silently change the wire format.
+String get platformTag {
+  if (kIsWeb) return 'web';
+  return switch (defaultTargetPlatform) {
+    TargetPlatform.macOS => 'macos',
+    TargetPlatform.windows => 'windows',
+    TargetPlatform.linux => 'linux',
+    TargetPlatform.android => 'android',
+    TargetPlatform.iOS => 'ios',
+    TargetPlatform.fuchsia => 'fuchsia',
+  };
+}

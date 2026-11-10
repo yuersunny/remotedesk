@@ -26,6 +26,9 @@ class MobileSessionView extends StatefulWidget {
     this.remoteHello,
     this.controlEnabled = true,
     this.onControlChanged,
+    this.clipboardEnabled = true,
+    this.onClipboardChanged,
+    this.onPushClipboard,
   });
 
   final RtcSession session;
@@ -35,6 +38,9 @@ class MobileSessionView extends StatefulWidget {
   final proto.HelloEvent? remoteHello;
   final bool controlEnabled;
   final ValueChanged<bool>? onControlChanged;
+  final bool clipboardEnabled;
+  final ValueChanged<bool>? onClipboardChanged;
+  final VoidCallback? onPushClipboard;
 
   @override
   State<MobileSessionView> createState() => _MobileSessionViewState();
@@ -351,6 +357,10 @@ class _MobileSessionViewState extends State<MobileSessionView>
                   widget.onControlChanged?.call(!widget.controlEnabled);
                 case 'reset':
                   setState(_viewport.reset);
+                case 'push':
+                  widget.onPushClipboard?.call();
+                case 'clipboard':
+                  widget.onClipboardChanged?.call(!widget.clipboardEnabled);
               }
             },
             itemBuilder: (context) => <PopupMenuEntry<String>>[
@@ -359,6 +369,21 @@ class _MobileSessionViewState extends State<MobileSessionView>
                 child: Text(widget.controlEnabled ? '改成「只看不控」' : '恢复控制'),
               ),
               const PopupMenuItem(value: 'reset', child: Text('还原画面大小')),
+              const PopupMenuDivider(),
+              // Copying on the phone and pasting on the computer is the one
+              // cross-device move a phone makes constantly — a code, a link,
+              // an address — so it earns a menu entry rather than staying
+              // desktop-only.
+              const PopupMenuItem(
+                value: 'push',
+                child: Text('把手机剪贴板发到电脑'),
+              ),
+              PopupMenuItem(
+                value: 'clipboard',
+                child: Text(
+                  widget.clipboardEnabled ? '关闭剪贴板同步' : '开启剪贴板同步',
+                ),
+              ),
             ],
           ),
         ],

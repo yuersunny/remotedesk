@@ -26,6 +26,10 @@ class SessionView extends StatefulWidget {
     this.remoteHello,
     this.controlEnabled = true,
     this.onControlChanged,
+    this.clipboardEnabled = true,
+    this.onClipboardChanged,
+    this.onPushClipboard,
+    this.commandAsControl = false,
   });
 
   final RtcSession session;
@@ -41,6 +45,23 @@ class SessionView extends StatefulWidget {
   final bool controlEnabled;
 
   final ValueChanged<bool>? onControlChanged;
+
+  /// Whether clipboard text is being mirrored in both directions.
+  final bool clipboardEnabled;
+
+  final ValueChanged<bool>? onClipboardChanged;
+
+  /// Push the local clipboard to the peer now, without waiting for a change.
+  final VoidCallback? onPushClipboard;
+
+  /// Send ⌘ as Ctrl instead of as the Windows/Super key.
+  ///
+  /// Meaningful when this machine is a Mac and the far end is not: ⌘ sits
+  /// exactly where every other platform keeps Ctrl, so a Mac user pressing
+  /// ⌘C means "copy" — but the key itself travels as Super/Cmd, and on Windows
+  /// Win+C opens a system panel instead of copying anything. The caller decides
+  /// this (it knows the peer's platform from `hello`); this view only applies it.
+  final bool commandAsControl;
 
   @override
   State<SessionView> createState() => _SessionViewState();
@@ -192,6 +213,23 @@ class _SessionViewState extends State<SessionView>
             const SizedBox(width: 8),
             _controlChip(),
           ],
+          const SizedBox(width: 8),
+          _clipboardChip(),
+          if (widget.clipboardEnabled && widget.onPushClipboard != null)
+            IconButton(
+              tooltip: '把本机剪贴板发到对面',
+              visualDensity: VisualDensity.compact,
+              onPressed: widget.phase == SessionPhase.live
+                  ? widget.onPushClipboard
+                  : null,
+              icon: Icon(
+                Icons.content_paste_go,
+                size: 17,
+                color: widget.phase == SessionPhase.live
+                    ? Colors.white70
+                    : Colors.white24,
+              ),
+            ),
           const Spacer(),
           TextButton.icon(
             onPressed: widget.onHangUp,
@@ -218,6 +256,29 @@ class _SessionViewState extends State<SessionView>
       child: _chip(
         icon: armed ? Icons.mouse : Icons.mouse_outlined,
         label: armed ? '控制中' : '只看不控',
+        color: color,
+      ),
+    );
+  }
+
+  /// Clipboard mirroring on/off.
+  ///
+  /// Shown on both ends, because both ends push: a target user copying
+  /// something on their own machine also wants it over here.
+  Widget _clipboardChip() {
+    final on = widget.clipboardEnabled;
+    final live = widget.phase == SessionPhase.live;
+    final color = !live
+        ? Colors.white38
+        : (on ? const Color(0xFF4ADE80) : const Color(0xFF94A3B8));
+    return InkWell(
+      onTap: widget.onClipboardChanged == null
+          ? null
+          : () => widget.onClipboardChanged!(!on),
+      borderRadius: BorderRadius.circular(20),
+      child: _chip(
+        icon: on ? Icons.content_paste : Icons.content_paste_off,
+        label: on ? '剪贴板' : '剪贴板关',
         color: color,
       ),
     );
@@ -487,8 +548,11 @@ class _SessionViewState extends State<SessionView>
 
     // Physical keys, not logical ones: the target must receive the key that was
     // pressed, regardless of the controller's layout or IME state.
-    final key = proto.InputKey.fromHidUsage(event.physicalKey.usbHidUsage);
-    if (key == null) return false;
+    final physical = proto.InputKey.fromHidUsage(event.physicalKey.usbHidUsage);
+    if (physical == null) return false;
+    // Map once, and remember it: the release has to send the same id the press
+    // did, or the remote machine keeps the unmapped key held down forever.
+    final key = _mapKey(physical);
 
     if (event is KeyDownEvent) {
       _pressedKeys.add(key);
@@ -508,6 +572,10 @@ class _SessionViewState extends State<SessionView>
     // forwarding these would roughly double the repeat rate.
     return false;
   }
+
+  /// ⌘ → Ctrl when the far end has no ⌘ key (see [SessionView.commandAsControl]).
+  proto.InputKey _mapKey(proto.InputKey key) =>
+      widget.commandAsControl ? proto.metaAsControl(key) : key;
 
   /// Current modifier state, sampled per event rather than tracked: the OS is
   /// the authority on what is physically held.
@@ -530,7 +598,9 @@ class _SessionViewState extends State<SessionView>
         pressed.contains(LogicalKeyboardKey.metaRight)) {
       mask |= proto.InputModifier.meta;
     }
-    return mask;
+    return widget.commandAsControl
+        ? proto.modifiersMetaAsControl(mask)
+        : mask;
   }
 
   /// Target side: deliberately **no** local preview.

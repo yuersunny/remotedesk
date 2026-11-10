@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'dart:math' show Random;
 
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart'
+    show kIsWeb, TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -10,6 +11,7 @@ import 'package:uuid/uuid.dart';
 
 // Prefixed: `package:flutter/material.dart` also exports a `KeyEvent`
 // (the hardware-keyboard one), and this file needs both.
+import 'src/clipboard_sync.dart';
 import 'src/input_event.dart' as proto;
 import 'src/diag_log.dart';
 // Finds the other machine instead of asking the user for an address: the
@@ -48,7 +50,7 @@ const List<Map<String, dynamic>> kDefaultIceServers = <Map<String, dynamic>>[
 /// Shown in the phone UI. Kept in step with `version:` in pubspec.yaml by hand:
 /// reading it back at runtime would pull in a plugin and a native call just to
 /// print a string.
-const String kAppVersion = '1.0.6';
+const String kAppVersion = '1.0.7';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -122,6 +124,8 @@ class _HomePageState extends State<HomePage> implements MobileHost {
   static const _kUnattended = 'unattended';
   static const _kUnattendedPassword = 'unattended_password';
   static const _kRecentPeers = 'recent_peers';
+  static const _kClipboard = 'clipboard_sync';
+  static const _kCmdAsCtrl = 'cmd_as_ctrl';
 
   /// Signaling for the target side of a session: this app connected to its own
   /// relay, waiting to be called.
@@ -227,6 +231,23 @@ class _HomePageState extends State<HomePage> implements MobileHost {
     },
   );
   StreamSubscription<proto.InputEvent>? _inputSub;
+
+  /// Clipboard mirroring for the duration of a session.
+  ///
+  /// Runs on both ends: whichever side copies, the other side gets the text.
+  /// Kept outside the session object because it must keep its "what we last
+  /// saw" baseline across a reconnect — otherwise reconnecting re-pushes
+  /// whatever happens to be in the clipboard.
+  late final ClipboardSync _clipboard = ClipboardSync(
+    backend: const FlutterClipboardBackend(),
+    onLog: _log,
+    onLocalText: _sendClipboard,
+  );
+
+  bool _clipboardEnabled = true;
+
+  /// Send ⌘ as Ctrl when the far end is not a Mac (see [_commandAsControl]).
+  bool _cmdAsCtrl = true;
 
   /// Geometry the target reported, shown in the controller HUD.
   proto.HelloEvent? _remoteHello;
@@ -344,6 +365,8 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       _unattended = prefs.getBool(_kUnattended) ?? false;
       _unattendedPassword = prefs.getString(_kUnattendedPassword) ?? '';
       _unattendedPassCtrl.text = _unattendedPassword;
+      _clipboardEnabled = prefs.getBool(_kClipboard) ?? true;
+      _cmdAsCtrl = prefs.getBool(_kCmdAsCtrl) ?? true;
       _recentCodes = recentCodes;
     });
     _log('本机设备ID: $deviceId');
@@ -693,6 +716,7 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       _busy = false;
     });
     _bindSessionInput(session);
+    await _startClipboard();
     try {
       await session.start();
       await session.createOffer();
@@ -763,6 +787,7 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       _busy = false;
     });
     _bindSessionInput(session);
+    await _startClipboard();
 
     // Accept only once we really have frames to send.
     _activeSignaling.accept(peer);
@@ -783,6 +808,66 @@ class _HomePageState extends State<HomePage> implements MobileHost {
     _reportTitle();
   }
 
+  /// True when ⌘ should travel as Ctrl.
+  ///
+  /// Only macOS has ⌘, and it sits exactly where every other platform keeps
+  /// Ctrl — so a Mac user pressing ⌘C means "copy". Sending it as the Win/Super
+  /// key makes Windows open a system panel instead, which reads as "copying to
+  /// the other machine does not work".
+  ///
+  /// Deliberately conservative about the unknown case: an older peer does not
+  /// report its platform, and rewriting ⌘ to Ctrl for a Mac-to-Mac session
+  /// would silently break every shortcut the user knows.
+  bool get _commandAsControl {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.macOS) return false;
+    if (!_cmdAsCtrl) return false;
+    final remote = _remoteHello?.platform ?? '';
+    return remote.isNotEmpty && remote != 'macos';
+  }
+
+  void _sendClipboard(String text) {
+    final session = _session;
+    if (session == null) return;
+    if (!session.input.isOpen) {
+      // Not queued on purpose: by the time the channel opens, the text can be
+      // minutes old, and pushing stale clipboard content into someone's machine
+      // is worse than not pushing it. The toolbar's push button is the retry.
+      _log('输入通道未就绪，本次剪贴板未发送');
+      return;
+    }
+    session.input.send(proto.ClipboardEvent(text));
+  }
+
+  Future<void> _startClipboard() async {
+    if (!_clipboardEnabled) return;
+    // baseline: what is on the clipboard at connect time is *not* news. Pushing
+    // it would overwrite whatever the other side had prepared.
+    await _clipboard.start();
+    _log('剪贴板同步已开启（两个方向）');
+  }
+
+  Future<void> _setClipboardEnabled(bool on) async {
+    setState(() => _clipboardEnabled = on);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_kClipboard, on);
+    if (on && _session != null) {
+      await _clipboard.start();
+    } else {
+      await _clipboard.stop();
+    }
+    _log(on ? '剪贴板同步已开启（两个方向）' : '剪贴板同步已关闭');
+  }
+
+  /// Ship the clipboard as it is right now.
+  ///
+  /// Covers the case "nothing is pushed on connect": text copied *before*
+  /// dialling would otherwise never reach the other side, since no change
+  /// happens after the baseline is taken.
+  Future<void> _pushClipboard() async {
+    if (!_clipboard.isRunning) await _clipboard.start(baseline: false);
+    await _clipboard.pushNow();
+  }
+
   /// Route inbound input frames.
   ///
   /// On the target every non-handshake event goes straight into the local
@@ -799,12 +884,22 @@ class _HomePageState extends State<HomePage> implements MobileHost {
         if (!mounted) return;
         setState(() => _remoteHello = event);
         _log('远端桌面 ${event.screenWidth}×${event.screenHeight}'
-            '（画面 ${event.videoWidth}×${event.videoHeight}）');
+            '（画面 ${event.videoWidth}×${event.videoHeight}）'
+            '${event.platform.isEmpty ? ' · 平台未知（老版本）' : ' · ${event.platform}'}');
+        // Say it once, in the log, because "my ⌘C does not copy over there" is
+        // otherwise indistinguishable from a broken keyboard.
+        if (_commandAsControl) _log('⌘ 键将作为 Ctrl 发送');
         _reportTitle();
         return;
       }
       // Count before injecting: the count proves the frame crossed the wire,
       // which is the part that can be verified without a native target.
+      if (event is proto.ClipboardEvent) {
+        // State transfer, not input: it changes the local clipboard and never
+        // touches the injector.
+        await _clipboard.applyRemote(event.text);
+        return;
+      }
       _inputRx++;
       if (event is proto.PointerMove) {
         _moveRx++;
@@ -847,6 +942,7 @@ class _HomePageState extends State<HomePage> implements MobileHost {
     _statsTimer = null;
     _inputSub?.cancel();
     _inputSub = null;
+    await _clipboard.stop();
     _remoteHello = null;
     final session = _session;
     if (session == null) return;
@@ -1354,6 +1450,10 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       onControlChanged: session.role == SessionRole.controller
           ? (value) => setState(() => _controlEnabled = value)
           : null,
+      clipboardEnabled: _clipboardEnabled,
+      onClipboardChanged: _setClipboardEnabled,
+      onPushClipboard: _pushClipboard,
+      commandAsControl: _commandAsControl,
     );
   }
 
@@ -2194,6 +2294,17 @@ class _HomePageState extends State<HomePage> implements MobileHost {
 
   @override
   bool get controlEnabled => _controlEnabled;
+
+  @override
+  bool get clipboardEnabled => _clipboardEnabled;
+
+  @override
+  Future<void> pushClipboard() => _pushClipboard();
+
+  @override
+  void setClipboardEnabled(bool on) {
+    unawaited(_setClipboardEnabled(on));
+  }
 
   @override
   String get version => kAppVersion;

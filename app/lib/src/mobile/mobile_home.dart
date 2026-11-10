@@ -20,6 +20,7 @@ abstract interface class MobileHost {
   String get selfId;
   List<String> get logLines;
   bool get controlEnabled;
+  bool get clipboardEnabled;
   String get version;
 
   Future<void> rescan();
@@ -27,7 +28,9 @@ abstract interface class MobileHost {
   Future<void> connectByCode(String raw);
   Future<void> connectManual(String target);
   Future<void> hangUp();
+  Future<void> pushClipboard();
   void setControlEnabled(bool on);
+  void setClipboardEnabled(bool on);
 }
 
 /// Home screen of the phone build: pick a computer, or paste a pairing code.
@@ -69,6 +72,9 @@ class _MobileHomePageState extends State<MobileHomePage> {
         remoteHello: host.remoteHello,
         controlEnabled: host.controlEnabled,
         onControlChanged: host.setControlEnabled,
+        clipboardEnabled: host.clipboardEnabled,
+        onClipboardChanged: host.setClipboardEnabled,
+        onPushClipboard: host.pushClipboard,
         onHangUp: host.hangUp,
       );
     }

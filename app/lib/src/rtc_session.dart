@@ -5,6 +5,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import 'input_channel.dart';
 import 'input_event.dart';
+import 'platform_kind.dart';
 import 'signaling_client.dart';
 
 /// Who we are in a session.
@@ -312,6 +313,7 @@ class RtcSession {
       screenHeight: screenHeight,
       videoWidth: videoWidth,
       videoHeight: videoHeight,
+      platform: platformTag,
     ));
     _log('已上报桌面尺寸 $screenWidth×$screenHeight'
         '（画面 $videoWidth×$videoHeight）');

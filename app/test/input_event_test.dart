@@ -241,4 +241,33 @@ void main() {
       expect(RemoteViewFit.none.visible, isFalse);
     });
   });
+
+  group('command as control', () {
+    test('sends ⌘C as Ctrl+C for a target with no ⌘', () {
+      // The whole point: a Mac user pressing ⌘C means "copy", and Windows turns
+      // Win+C into a system panel instead.
+      expect(metaAsControl(InputKey.metaLeft), InputKey.controlLeft);
+      expect(metaAsControl(InputKey.metaRight), InputKey.controlRight);
+    });
+
+    test('leaves every other key alone', () {
+      expect(metaAsControl(InputKey.keyC), InputKey.keyC);
+      expect(metaAsControl(InputKey.controlLeft), InputKey.controlLeft);
+      expect(metaAsControl(InputKey.altLeft), InputKey.altLeft);
+    });
+
+    test('rewrites the meta modifier bit and keeps the others', () {
+      final mask = InputModifier.meta | InputModifier.shift;
+      final mapped = modifiersMetaAsControl(mask);
+      expect(mapped & InputModifier.meta, 0);
+      expect(mapped & InputModifier.control, InputModifier.control);
+      expect(mapped & InputModifier.shift, InputModifier.shift);
+    });
+
+    test('does not invent a Ctrl when ⌘ is not held', () {
+      final mask = InputModifier.shift | InputModifier.alt;
+      expect(modifiersMetaAsControl(mask), mask);
+      expect(modifiersMetaAsControl(0), 0);
+    });
+  });
 }

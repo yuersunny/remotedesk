@@ -241,6 +241,8 @@ sealed class InputEvent {
         return PointerWheelEvent.fromJson(json);
       case 'key':
         return KeyEvent.tryFromJson(json);
+      case 'cb':
+        return ClipboardEvent.fromJson(json);
       default:
         return null;
     }
@@ -276,6 +278,7 @@ class HelloEvent extends InputEvent {
     this.scaleFactor = 1.0,
     this.videoWidth = 0,
     this.videoHeight = 0,
+    this.platform = '',
   });
 
   /// Target screen size in physical pixels.
@@ -291,6 +294,17 @@ class HelloEvent extends InputEvent {
   final int videoWidth;
   final int videoHeight;
 
+  /// `Platform.operatingSystem` on the target — `macos`, `windows`, `linux`.
+  ///
+  /// The controller needs this for one decision only: a macOS keyboard has ⌘
+  /// where every other platform has Ctrl, so whether ⌘ travels as ⌘ or as
+  /// Ctrl depends on what is on the far end. Empty means an older peer that
+  /// did not report it; the controller then leaves modifiers untouched.
+  final String platform;
+
+  /// True when the far end is a Mac, i.e. ⌘ means ⌘ there.
+  bool get isMacTarget => platform == 'macos';
+
   @override
   String get type => 'hello';
 
@@ -300,6 +314,7 @@ class HelloEvent extends InputEvent {
         scaleFactor: InputEvent._d(json['s'], 1),
         videoWidth: InputEvent._i(json['vw']),
         videoHeight: InputEvent._i(json['vh']),
+        platform: (json['p'] as String?) ?? '',
       );
 
   @override
@@ -310,6 +325,7 @@ class HelloEvent extends InputEvent {
         's': scaleFactor,
         'vw': videoWidth,
         'vh': videoHeight,
+        if (platform.isNotEmpty) 'p': platform,
       };
 
   @override
@@ -467,6 +483,65 @@ class KeyEvent extends InputEvent {
 
   @override
   String toString() => 'KeyEvent(${key.code}, pressed=$pressed)';
+}
+
+/// Clipboard text, travelling in either direction.
+///
+/// Plain text only, on purpose. Images and rich text have no shared
+/// representation across platforms — Word HTML on one side, RTF on another — so
+/// converting them produces something that *looks* synced and pastes wrong.
+/// Saying "text only" is the honest version.
+///
+/// This is the one event on the channel that is not idempotent input but state
+/// transfer, so it is also the only one with a size limit: an SCTP message tops
+/// out at 256 KB and JSON escaping inflates whatever it carries.
+class ClipboardEvent extends InputEvent {
+  const ClipboardEvent(this.text);
+
+  final String text;
+
+  /// Refuse anything that could exceed one SCTP message once escaped.
+  static const int maxBytes = 160 * 1024;
+
+  /// UTF-8 byte count, which is what the wire limit is measured in — a string
+  /// of 100 000 Chinese characters is 300 KB even though its `length` is 100 000.
+  static int byteLength(String text) => utf8.encode(text).length;
+
+  @override
+  String get type => 'cb';
+
+  factory ClipboardEvent.fromJson(Map<String, Object?> json) =>
+      ClipboardEvent((json['x'] as String?) ?? '');
+
+  @override
+  Map<String, Object?> toJson() => <String, Object?>{
+        't': type,
+        'x': text,
+      };
+
+  @override
+  String toString() => 'Clipboard(${text.length} chars)';
+}
+
+/// ⌘ sent as Ctrl, for a target that has no ⌘ key.
+///
+/// A Mac keyboard puts ⌘ exactly where every other platform puts Ctrl, so ⌘C
+/// is how a Mac user copies — but the key itself is Meta/Super on the wire, and
+/// Windows turns Win+C into a system panel rather than a copy. Remapping is the
+/// only way "copy on my Mac, paste on the Windows box" behaves as expected.
+///
+/// Only Meta becomes Ctrl; every other key passes through untouched, including
+/// Ctrl itself (a Mac user who actually wants Ctrl still has the Ctrl key).
+InputKey metaAsControl(InputKey key) => switch (key) {
+      InputKey.metaLeft => InputKey.controlLeft,
+      InputKey.metaRight => InputKey.controlRight,
+      _ => key,
+    };
+
+/// Same substitution for a modifier bitmask (see [metaAsControl]).
+int modifiersMetaAsControl(int modifiers) {
+  if (modifiers & InputModifier.meta == 0) return modifiers;
+  return (modifiers & ~InputModifier.meta) | InputModifier.control;
 }
 
 /// Where the video picture actually sits inside a widget of a different aspect

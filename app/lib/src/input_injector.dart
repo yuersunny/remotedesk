@@ -242,6 +242,12 @@ class InputInjector {
         case HelloEvent():
           // Target → controller only; nothing to inject.
           break;
+        case ClipboardEvent():
+          // Applied to the local pasteboard by the session owner. Reaching here
+          // would mean the routing skipped that, and typing the text through
+          // synthetic keys instead would be both slow and wrong for anything
+          // outside ASCII.
+          break;
       }
     } catch (_) {
       // Swallow: see the method comment.

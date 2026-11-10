@@ -20,6 +20,17 @@ class _FakeHost implements MobileHost {
   bool controlEnabled = true;
 
   @override
+  bool clipboardEnabled = true;
+
+  int clipboardPushes = 0;
+
+  @override
+  Future<void> pushClipboard() async => clipboardPushes++;
+
+  @override
+  void setClipboardEnabled(bool on) => clipboardEnabled = on;
+
+  @override
   bool get scanning => false;
   @override
   RtcSession? get session => null;
