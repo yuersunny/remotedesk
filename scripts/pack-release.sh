@@ -56,11 +56,19 @@ rsync -a \
 echo "==> 复制源码（仅 git 跟踪的文件）"
 cd "$ROOT"
 git ls-files -z | rsync -a --from0 --files-from=- ./ "$OUT/source/"
-# .git 一起带上（朋友能 git log 看这十几轮是怎么长出来的），去掉重写残留。
+# .git 一起带上（朋友能 git log 看这十几轮是怎么长出来的）。
+# 但只带"历史本身"：reflog（logs/）里存着重写前的旧提交信息，COMMIT_EDITMSG 是
+# 上一次 commit 的草稿——这两个都不是历史的一部分，却是最容易漏出去的副本。
+# 源路径带结尾斜杠，避免 rsync 把 .git 套成 .git/.git。
 rsync -a \
+  --exclude 'logs/' \
   --exclude 'hooks/' \
+  --exclude 'COMMIT_EDITMSG' \
+  --exclude 'ORIG_HEAD' \
+  --exclude 'FETCH_HEAD' \
+  --exclude 'refs/original/' \
   --exclude 'objects/info/commit-graph' \
-  "$ROOT/.git" "$OUT/source/.git"
+  "$ROOT/.git/" "$OUT/source/.git/"
 cd "$ROOT"
 
 # 工作区若有未提交改动，源码快照就不等于发行版，先拦住。
@@ -141,13 +149,29 @@ fi
 echo "==> 隐私自检"
 CHK="$(mktemp -d)"
 unzip -q "$ZIP" -d "$CHK"
-PRIV_HITS="$(grep -rIl --binary-files=without-match \
-  -E '7Q4WT9|100\.86\.168\.53|100\.108\.183\.61|某人|192\.168\.1\.123' \
-  "$CHK" 2>/dev/null | sed "s|$CHK/||" || true)"
-IDE_HITS="$(find "$CHK" -type d -name '.idea' -o -type f -name 'local.properties' 2>/dev/null \
-  | sed "s|$CHK/||" | head -5)"
-HIST_HITS="$(git -C "$CHK/RemoteDesk-$VERSION/source" log --all --format='%s%n%b' 2>/dev/null \
-  | grep -cE '7Q4WT9|100\.86\.168\.53|100\.108\.183\.61|某人' || true)"
+# 黑名单放在仓库外的本机文件里（.privacy-blocklist，已 gitignore）。
+# 写死在脚本里有两个恶果：黑名单本身会随包发出去（等于把要藏的东西印在封面），
+# 而且扫描时会自匹配。没有这个文件就只跳过正文扫描，历史检查照旧。
+BLOCK="$ROOT/.privacy-blocklist"
+PRIV_HITS=""
+if [ -f "$BLOCK" ]; then
+  while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    # 前缀用参数展开而不是 sed：mktemp 路径里有 "."，当正则用会乱匹配。
+    PRIV_HITS="${PRIV_HITS}${hit#"$CHK"/}"$'\n'
+  done <<< "$(grep -rIl --binary-files=without-match -F -f "$BLOCK" "$CHK" 2>/dev/null || true)"
+fi
+IDE_HITS=""
+while IFS= read -r hit; do
+  [ -z "$hit" ] && continue
+  IDE_HITS="${IDE_HITS}${hit#"$CHK"/}"$'\n'
+done <<< "$(find "$CHK" \( -type d -name '.idea' -o -type f -name 'local.properties' \) 2>/dev/null | head -5 || true)"
+if [ -f "$BLOCK" ]; then
+  HIST_HITS="$(git -C "$CHK/RemoteDesk-$VERSION/source" log --all --format='%s%n%b' 2>/dev/null \
+    | grep -cF -f "$BLOCK" || true)"
+else
+  HIST_HITS=0
+fi
 rm -rf "$CHK"
 
 if [ -n "$PRIV_HITS" ]; then
@@ -155,7 +179,11 @@ if [ -n "$PRIV_HITS" ]; then
   echo "$PRIV_HITS" | sed 's/^/       /' >&2
   FAIL=1
 else
-  echo "  [ok] 文本里无密码 / tailnet IP / 真名残留"
+  if [ -f "$BLOCK" ]; then
+    echo "  [ok] 文本里无密码 / tailnet IP / 真名残留"
+  else
+    echo "  [--] 无 .privacy-blocklist，跳过正文扫描（历史检查仍需该文件）"
+  fi
 fi
 if [ -n "$IDE_HITS" ]; then
   echo "  [!!] 包里带了 IDE 配置或本机 SDK 路径：" >&2

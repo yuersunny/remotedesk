@@ -51,3 +51,6 @@ app/android/keystore/
 # 打包中间产物（pack-release.sh 解出来的目录）
 dist/release/
 dist/RemoteDesk-*/
+
+# 隐私黑名单：里面是要藏的值，只留在本机
+.privacy-blocklist
