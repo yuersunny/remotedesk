@@ -3,10 +3,19 @@
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/>
+    <!-- Signaling is plain ws:// to a machine on the same LAN or tailnet, and
+         /info is plain http://. Dart's socket stack is not subject to the
+         cleartext policy, but leaving the flag off has bitten other builds
+         talking to LAN peers, and there is nothing to protect here: the
+         address is the peer's own and the password travels inside the pairing
+         code, not on the wire in the clear by accident. -->
     <application
-        android:label="remotedesk"
+        android:label="RemoteDesk"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"
             android:exported="true"

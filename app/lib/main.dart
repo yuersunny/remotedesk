@@ -18,7 +18,11 @@ import 'src/diag_log.dart';
 import 'src/discovery_stub.dart'
     if (dart.library.io) 'src/discovery_io.dart';
 import 'src/input_injector.dart';
+// The phone build is controller-only and needs a completely different layout:
+// thumbs instead of a mouse, a soft keyboard instead of a physical one.
+import 'src/mobile/mobile_home.dart';
 import 'src/pairing_code.dart';
+import 'src/platform_kind.dart';
 import 'src/peer_info.dart';
 import 'src/rtc_session.dart';
 import 'src/screen_capture.dart';
@@ -40,6 +44,11 @@ const List<Map<String, dynamic>> kDefaultIceServers = <Map<String, dynamic>>[
   <String, dynamic>{'urls': 'stun:stun.l.google.com:19302'},
   <String, dynamic>{'urls': 'stun:stun.cloudflare.com:3478'},
 ];
+
+/// Shown in the phone UI. Kept in step with `version:` in pubspec.yaml by hand:
+/// reading it back at runtime would pull in a plugin and a native call just to
+/// print a string.
+const String kAppVersion = '1.0.6';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -86,7 +95,13 @@ class RemoteDeskApp extends StatelessWidget {
       title: 'RemoteDesk',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1565C0)),
+        // The phone build runs dark: the session screen is a black stage, and a
+        // white home screen flashing between them is jarring at night, which is
+        // exactly when someone reaches for a phone to fix a machine.
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF1565C0),
+          brightness: isHandheld ? Brightness.dark : Brightness.light,
+        ),
         useMaterial3: true,
       ),
       home: const HomePage(),
@@ -101,7 +116,7 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> implements MobileHost {
   static const _kRelayOverride = 'relay_url';
   static const _kDevice = 'device_id';
   static const _kUnattended = 'unattended';
@@ -181,6 +196,9 @@ class _HomePageState extends State<HomePage> {
 
   bool _connected = false;
   bool _busy = false;
+  /// True once startup finished. The phone UI shows this instead of the relay
+  /// state, because the phone never holds a relay connection of its own.
+  bool _ready = false;
   String? _selfId;
 
   /// Which signaling connection the live session belongs to.
@@ -273,14 +291,17 @@ class _HomePageState extends State<HomePage> {
     });
     // Probe the injector once, up front: knowing early that this build cannot
     // inject input is far more useful than discovering it after a session.
-    _injector.init().then((support) {
-      if (!mounted) return;
-      setState(() {});
-      // Prove the pipe at every launch: `available` only says the platform
-      // reports a permission, and `CGEventPost` still no-ops silently when it
-      // does not really hold.
-      if (support.available) _injector.selfTest();
-    });
+    // The phone build never injects (it is not a target), so it does not ask.
+    if (canHostScreen) {
+      _injector.init().then((support) {
+        if (!mounted) return;
+        setState(() {});
+        // Prove the pipe at every launch: `available` only says the platform
+        // reports a permission, and `CGEventPost` still no-ops silently when it
+        // does not really hold.
+        if (support.available) _injector.selfTest();
+      });
+    }
   }
 
   Future<void> _bootstrap() async {
@@ -335,32 +356,41 @@ class _HomePageState extends State<HomePage> {
       await Future<void>.delayed(const Duration(milliseconds: 300));
     }
 
-    // Every machine relays for itself.
-    //
-    // This used to be conditional — "host only if no server was configured" —
-    // because two machines each on their own loopback became two islands that
-    // both reported "online" and could not see each other. The fix is not to
-    // designate one of them; it is to stop needing a shared relay at all. Each
-    // machine joins its own relay and waits to be called; dialling a peer means
-    // joining *that peer's* relay for the length of the handshake. Being
-    // reachable and reaching are then independent, and "who is the server" is
-    // no longer a question the user is asked.
-    await _startHosting(quietWhenTaken: true);
+    if (canHostScreen) {
+      // Every machine relays for itself.
+      //
+      // This used to be conditional — "host only if no server was configured" —
+      // because two machines each on their own loopback became two islands that
+      // both reported "online" and could not see each other. The fix is not to
+      // designate one of them; it is to stop needing a shared relay at all. Each
+      // machine joins its own relay and waits to be called; dialling a peer means
+      // joining *that peer's* relay for the length of the handshake. Being
+      // reachable and reaching are then independent, and "who is the server" is
+      // no longer a question the user is asked.
+      await _startHosting(quietWhenTaken: true);
 
-    // Announce on the LAN and re-announce periodically, so the other side's
-    // scan finds us even if it starts later.
-    await _discovery.startResponder(selfId: deviceId);
-    _discovery.startAnnouncing();
+      // Announce on the LAN and re-announce periodically, so the other side's
+      // scan finds us even if it starts later.
+      await _discovery.startResponder(selfId: deviceId);
+      _discovery.startAnnouncing();
 
-    // Connect at launch either way. "Fill in a server address, then press 连接"
-    // was a step users should never have had to think about — the address is
-    // remembered, so being online from the first second is the only sensible
-    // default. Failure is logged and leaves the app usable.
-    await _connect();
+      // Connect at launch either way. "Fill in a server address, then press 连接"
+      // was a step users should never have had to think about — the address is
+      // remembered, so being online from the first second is the only sensible
+      // default. Failure is logged and leaves the app usable.
+      await _connect();
+    } else {
+      // The phone never relays and never shares its own screen, so there is
+      // nothing to host and no reason to sit on a loopback connection to
+      // itself. It only ever dials out, which is what keeps the Android build
+      // free of foreground services and screen-capture permissions.
+      _log('手机端只当主控：不中转、不共享本机屏幕，只负责连到电脑');
+    }
 
     // Look for the other machine without being asked. It is a background scan:
     // if it finds nothing the list simply says so.
     unawaited(_scanPeers());
+    if (mounted) setState(() => _ready = true);
   }
 
   /// Scan both channels and rebuild the list.
@@ -917,9 +947,9 @@ class _HomePageState extends State<HomePage> {
   ///
   /// One field instead of three: the code carries address, id and password, so
   /// the person who pastes it never has to know which machine is relaying.
-  Future<void> _connectByCode() async {
-    final raw = _pairCtrl.text.trim();
-    final code = PairingCode.parse(raw);
+  Future<void> _connectByCode([String? raw]) async {
+    final source = (raw ?? _pairCtrl.text).trim();
+    final code = PairingCode.parse(source);
     if (code == null) {
       _log('这行字里没有可用的地址 — 让对方重新复制一次配对码');
       return;
@@ -929,8 +959,12 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     _log('配对码：连 ${code.id} @ ${code.host}:${code.port}');
+    if (_pairCtrl.text.trim() == source) {
+      setState(_pairCtrl.clear);
+    } else if (raw == null) {
+      setState(_pairCtrl.clear);
+    }
     setState(() {
-      _pairCtrl.clear();
       _targetCtrl.text = code.id;
       _targetHost = code.host;
       _targetPort = code.port;
@@ -1213,6 +1247,11 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
+    // One state object, two entirely different shells. Everything above this
+    // line — signaling, discovery, sessions — is shared, so the phone cannot
+    // drift away from the desktop behaviour.
+    if (isHandheld) return MobileHomePage(host: this);
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('RemoteDesk · M2 远程控制'),
@@ -2112,6 +2151,119 @@ class _HomePageState extends State<HomePage> {
           ),
         ],
       ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // MobileHost — the phone shell's only view of this state.
+  //
+  // Deliberately thin: every member either forwards to something that already
+  // existed or exposes one field. Nothing here re-implements behaviour, which
+  // is what keeps the phone and the desktop honest about doing the same thing.
+  // ---------------------------------------------------------------------------
+
+  @override
+  List<PeerInfo> get peers => _foundPeers;
+
+  @override
+  bool get scanning => _scanning;
+
+  @override
+  RtcSession? get session => _session;
+
+  @override
+  SessionPhase get phase => _phase;
+
+  @override
+  SessionStats get stats => _stats;
+
+  @override
+  proto.HelloEvent? get remoteHello => _remoteHello;
+
+  @override
+  bool get signalingUp => canHostScreen ? _connected : _ready;
+
+  @override
+  bool get busy => _busy;
+
+  @override
+  String get selfId => (_selfId ?? _deviceCtrl.text).trim();
+
+  @override
+  List<String> get logLines => List<String>.unmodifiable(_logs);
+
+  @override
+  bool get controlEnabled => _controlEnabled;
+
+  @override
+  String get version => kAppVersion;
+
+  @override
+  Future<void> rescan() => _scanPeers();
+
+  @override
+  Future<void> connectPeer(PeerInfo peer) => _connectToPeer(peer);
+
+  @override
+  Future<void> connectByCode(String raw) => _connectByCode(raw);
+
+  @override
+  void setControlEnabled(bool on) {
+    if (mounted) setState(() => _controlEnabled = on);
+  }
+
+  @override
+  Future<void> hangUp() => _hangUp();
+
+  /// Connect from a bare address, by asking that machine who it is.
+  ///
+  /// Typing an IP used to be impossible without also knowing the peer's id,
+  /// because the handshake addresses people by name. `/info` is the answer: one
+  /// GET tells us the id, so "address only" is a complete instruction again.
+  @override
+  Future<void> connectManual(String target) async {
+    var text = target.trim();
+    if (text.isEmpty) {
+      _log('先填电脑地址，比如 192.168.1.20 或 192.168.1.20:8787');
+      return;
+    }
+    text = text.replaceFirst(RegExp(r'^wss?://'), '').split('/').first;
+    var host = text;
+    var port = 8787;
+    final colon = text.lastIndexOf(':');
+    if (colon > 0) {
+      host = text.substring(0, colon);
+      port = int.tryParse(text.substring(colon + 1)) ?? port;
+    }
+    if (host.isEmpty) {
+      _log('这个地址看不懂：$target');
+      return;
+    }
+    _log('正在问 $host:$port 是谁…');
+    final info = await probeInfo(
+      host,
+      port: port,
+      timeout: const Duration(milliseconds: 1500),
+    );
+    if (info == null) {
+      _log('$host:$port 上没有响应 — 确认电脑端开着 RemoteDesk，且手机和它在同一个网络');
+      return;
+    }
+    final id = '${info['id'] ?? ''}'.trim();
+    if (id.isEmpty) {
+      _log('那台电脑没有报出名字 — 改用配对码更稳');
+      return;
+    }
+    final name = '${info['name'] ?? id}'.trim();
+    await _dialTo(
+      PeerInfo(
+        id: id,
+        host: host,
+        port: port,
+        name: name.isEmpty ? id : name,
+        source: PeerSource.manual,
+      ),
+      password: _passCtrl.text.trim(),
     );
   }
 

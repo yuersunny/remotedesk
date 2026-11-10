@@ -48,7 +48,12 @@ remotedesk/
   - **macOS 被控**：`CGEvent` 注入器已实现并编译进包（`app/macos/Runner/InputInjector.swift`），
     83 个 wire id 与 Windows / Dart 三端一致；差一次「辅助功能」授权后点按钮验证
   - 被控端覆盖 **Windows + macOS**；安卓（AccessibilityService）还没做
-- [ ] **M3** 安卓被控（MediaProjection + 无障碍注入）
+- [x] **M3-a 安卓主控**：手机连电脑（`dist/RemoteDesk-1.0.6-android-arm64.apk`）
+  - 单指=左键 / 单指按拖=拖动 / 长按=右键 / 双指滑=滚轮 / 双指捏合=放大画面
+  - 软键盘面板：英文数字符号、Ctrl·Alt·Shift·Win、方向键、F5、Del/Home/End/PgUp/PgDn
+  - 坐标要穿过「放大 + 平移」的变换再归一化，点哪儿就是哪儿（`lib/src/mobile/touch_input.dart`）
+  - 手机不中转、不共享本机屏幕：没有前台服务，也没有录屏授权弹窗
+- [ ] **M3-b 安卓被控**（MediaProjection 采集 + 无障碍服务注入）—— 未做
 - [ ] **M4** 优化：断线重连、剪贴板、文件传输、多屏
 
 ## 本地运行信令服务器
@@ -75,6 +80,32 @@ flutter run -d macos            # 需完整 Xcode
 flutter run -d windows          # 需 Windows + Visual Studio
 flutter run -d chrome           # 无 Xcode/VS 也能验证画面链路
 ```
+
+## 安卓端（手机当主控）
+
+和桌面端同一套 Dart 代码，只是壳不同：手机上的入口是 `lib/src/mobile/`，
+桌面仍是 `main.dart` 里的三张卡片；信令、发现、会话完全共用，所以两端不会各走各的。
+
+```bash
+./scripts/build-android.sh              # 出 arm64 安装包到 dist/
+./scripts/build-android.sh --universal  # 所有 ABI 一个包（大 30MB）
+python3 scripts/make-android-icon.py    # 重画图标（改了配色再跑）
+```
+
+- 要求：Android 7.0（API 24）以上；Flutter 3.47 需要 `compileSdk 36`
+- 装机：把 apk 传到手机点开装，允许一次「未知来源」
+- 签名：用项目自带密钥（`app/android/keystore/`），版本能覆盖安装；密钥丢了就要先卸载再装
+- 为什么只有主控：共享手机屏幕要 `MediaProjection` 授权 + 常驻前台服务，
+  操作手机还要无障碍服务；这一版不做，界面上也不会摆一个按不动的开关
+
+手机怎么连（用户视角）：
+
+1. 电脑先开 RemoteDesk，停在主界面
+2. 手机同一个 Wi-Fi 打开就有列表，点一下进
+3. 没有列表就粘配对码（电脑「这台电脑」卡片那一行）
+4. 跨网络：两台都上同一个 Tailscale，配对码里 100.x 地址照样连
+
+已知边界：输入通道传的是**按键**不是文本，所以中文/表情打不进去；要中文得在电脑上切输入法。
 
 Web 版可直接验证 M1：开两个标签页，分别用
 `http://localhost:8080/?id=aaa` 与 `http://localhost:8080/?id=bbb`

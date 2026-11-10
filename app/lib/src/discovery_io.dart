@@ -315,6 +315,14 @@ class _TsNode {
 /// back to the hostname gives `yushundongdemac-mini-279` — ugly but unique, and
 /// it is only a default the user can edit.
 Future<String> suggestedDeviceName() async {
+  // A phone reports `localhost` as its hostname and has no tailnet CLI, so the
+  // desktop default would name every phone "localhost" — the one name that
+  // tells the person on the other end nothing. A short random tag at least
+  // distinguishes two phones, and renaming is one tap on the desktop side.
+  if (Platform.isAndroid || Platform.isIOS) {
+    final tag = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
+    return 'phone-${tag.substring(tag.length - 4)}';
+  }
   final fromTailscale = await _tailscaleSelfName();
   if (fromTailscale.isNotEmpty) return fromTailscale;
   try {
