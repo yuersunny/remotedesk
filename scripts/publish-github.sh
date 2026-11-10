@@ -21,18 +21,24 @@ OWNER="$(gh api user --jq .login)"
 echo "==> 已登录：$OWNER"
 
 # ---- 2. 让提交挂到这个账号下 ------------------------------------------------
-# 本地提交的邮箱是占位的 yushundong@localhost，GitHub 认不出来（提交不会算到账号下、
-# 也没有头像）。.mailmap 只影响显示，不改写历史——比再跑一次 filter-branch 安全。
+# 本地提交的邮箱是占位形式（<用户名>@localhost），GitHub 认不出来（提交不会算到
+# 账号下、也没有头像）。.mailmap 只影响显示，不改写历史——比再跑一次
+# filter-branch 安全。
+# 名字和占位邮箱从本地 git 配置读，脚本因此不绑定某个具体账号。
+LOCAL_NAME="$(git config user.name || true)"
+LOCAL_EMAIL="$(git config user.email || true)"
+LOCAL_NAME="${LOCAL_NAME:-$OWNER}"
+LOCAL_EMAIL="${LOCAL_EMAIL:-$OWNER@localhost}"
 MAILMAP="$ROOT/.mailmap"
-WANT="yushundong <$OWNER@users.noreply.github.com> <yushundong@localhost>"
+WANT="$LOCAL_NAME <$OWNER@users.noreply.github.com> <$LOCAL_EMAIL>"
 if [ ! -f "$MAILMAP" ] || ! grep -qF "$OWNER@users.noreply.github.com" "$MAILMAP"; then
   printf '%s\n' "$WANT" > "$MAILMAP"
   git add .mailmap
-  git -c user.name="yushundong" -c user.email="$OWNER@users.noreply.github.com" \
+  git -c user.name="$LOCAL_NAME" -c user.email="$OWNER@users.noreply.github.com" \
       commit -q -m "加 .mailmap：让历史里的占位邮箱归属到 GitHub 账号
 
-本地提交一直用 yushundong@localhost，GitHub 认不出这是谁——提交列表里没有头像、
-也不算进贡献。.mailmap 只改显示，不改写历史。"
+本地提交一直用占位邮箱（<用户名>@localhost），GitHub 认不出这是谁——提交
+列表里没有头像、也不算进贡献。.mailmap 只改显示，不改写历史。"
   echo "==> 已加 .mailmap"
 fi
 

@@ -50,12 +50,17 @@ rsync -a \
   "$KIT/" "$OUT/installers/windows/"
 
 # ---- 3. 源码（带 .git，朋友能看历史、能直接接着改）--------------------------
-# 只复制 **git 跟踪的文件**。以前用 rsync 复制整个工作目录，于是 .idea/ 这类被
-# .gitignore 忽略的东西也会跟着进包——IDE 配置里写着构建机的绝对路径和用户名。
-# 以 git 索引为准，被忽略的一律不可能漏进来。
-echo "==> 复制源码（仅 git 跟踪的文件）"
+# 只导出 **git 索引里的文件**，且走 checkout-index 而不是从工作目录 rsync。
+# 两个理由：
+#   - rsync 整个工作目录会把 .idea/ 这类被忽略的东西一起带走，而
+#     .idea/libraries/Dart_SDK.xml 里写着构建机的绝对路径和用户名；
+#   - 工作目录里的字节不一定等于 clone 出来的字节。CRLF 规则写在 .gitattributes
+#     里，本地改动过行尾的文件靠 stat 缓存看不出差异，但换台机器 clone 就变了。
+#     checkout-index 会走同一套 eol/smudge 流程，导出的就是 clean clone 的样子。
+echo "==> 复制源码（按索引导出，等价于一次 clean clone）"
+mkdir -p "$OUT/source"
 cd "$ROOT"
-git ls-files -z | rsync -a --from0 --files-from=- ./ "$OUT/source/"
+git checkout-index -a -f --prefix="$OUT/source/"
 # .git 一起带上（朋友能 git log 看这十几轮是怎么长出来的）。
 # 但只带"历史本身"：reflog（logs/）里存着重写前的旧提交信息，COMMIT_EDITMSG 是
 # 上一次 commit 的草稿——这两个都不是历史的一部分，却是最容易漏出去的副本。

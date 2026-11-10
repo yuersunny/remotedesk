@@ -318,7 +318,7 @@ class _TsNode {
 /// The tailnet's own DNS name is the best source: it is a short, ASCII,
 /// human-chosen label (`mac-mini`, `win-pc`) that the other person can recognise and
 /// type, and it is identical on every machine that can see this one. Falling
-/// back to the hostname gives `yushundongdemac-mini-279` — ugly but unique, and
+/// back to the hostname gives `annmac-mini-279` — ugly but unique, and
 /// it is only a default the user can edit.
 Future<String> suggestedDeviceName() async {
   // A phone reports `localhost` as its hostname and has no tailnet CLI, so the
