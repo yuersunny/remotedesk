@@ -35,6 +35,18 @@ for doc in README.md LICENSE GETTING-STARTED.md DEVELOPING.md CHANGELOG.md; do
   cp "$ROOT/$doc" "$OUT/"
 done
 
+# 手册：Markdown 原文进包，PDF 若已生成也一并带上——收包的人更可能直接看 PDF。
+if [ -f "$ROOT/docs/使用说明书.md" ]; then
+  mkdir -p "$OUT/docs"
+  cp "$ROOT/docs/使用说明书.md" "$OUT/docs/"
+fi
+MANUAL_PDF="$ROOT/dist/RemoteDesk-$VERSION-使用说明书.pdf"
+if [ -f "$MANUAL_PDF" ]; then
+  cp "$MANUAL_PDF" "$OUT/"
+else
+  echo "  [!] 没有 $MANUAL_PDF，包里只带 Markdown 版（先跑 scripts/build-manual.py）" >&2
+fi
+
 # ---- 2. 安装包 --------------------------------------------------------------
 echo "==> 复制安装包"
 cp "$DMG" "$OUT/installers/"
@@ -86,11 +98,12 @@ cat > "$OUT/README-FIRST.txt" <<TXT
 RemoteDesk $VERSION
 
 直接用
+  00  使用说明书.pdf                                          ★ 先看这个（17 页，可打印）
   01  installers/RemoteDesk-$VERSION-macos-universal.dmg      macOS 13+（Intel / Apple Silicon）
   02  installers/RemoteDesk-$VERSION-android-arm64.apk        Android 7.0+，手机当主控
   03  installers/windows/START-HERE.md                        Windows：浏览器版免安装，或一键编译
 
-  装完先看 GETTING-STARTED.md。macOS 必须手动给「屏幕录制」和「辅助功能」两个权限，
+  装完先看 使用说明书.pdf。macOS 必须手动给「屏幕录制」和「辅助功能」两个权限，
   不给的话要么黑屏、要么画面正常但点不动。
 
 改代码
@@ -125,6 +138,8 @@ for probe in \
   "RemoteDesk-$VERSION/DEVELOPING.md" \
   "RemoteDesk-$VERSION/CHANGELOG.md" \
   "RemoteDesk-$VERSION/README-FIRST.txt" \
+  "RemoteDesk-$VERSION/docs/使用说明书.md" \
+  "RemoteDesk-$VERSION/使用说明书.pdf" \
   "RemoteDesk-$VERSION/installers/RemoteDesk-$VERSION-macos-universal.dmg" \
   "RemoteDesk-$VERSION/installers/RemoteDesk-$VERSION-android-arm64.apk" \
   "RemoteDesk-$VERSION/installers/windows/START-HERE.md" \

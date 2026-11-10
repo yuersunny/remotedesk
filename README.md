@@ -20,7 +20,9 @@
 用法三步：两台机器都打开 → 同一个 Wi-Fi 下会自动出现在列表里 → 点一下就连上。
 列表里没有就用「配对码」：被控端界面上那行字，复制粘贴过去。
 
-手势、快捷键、排查步骤见 [`GETTING-STARTED.md`](GETTING-STARTED.md)。
+**第一次用、或者要交给不懂技术的人，看 [`docs/使用说明书.md`](docs/使用说明书.md)**——
+里面的 PDF 版（`dist/RemoteDesk-1.0.7-使用说明书.pdf`，17 页）可以直接发微信，讲清了安装、授权、
+IP 与端口、配对码、失败排查。手势、快捷键、速查表见 [`GETTING-STARTED.md`](GETTING-STARTED.md)。
 
 ### Windows 为什么没有 exe
 
