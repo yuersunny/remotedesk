@@ -231,6 +231,12 @@ class PeerDiscovery {
   /// on the app's port; a node that answers becomes a usable row, and a node
   /// that is online but silent is dropped rather than shown as connectable.
   Future<List<PeerInfo>> _scanTailscale({required Duration timeout}) async {
+    // Phones have no tailnet CLI: the Tailscale app is a VPN service, and its
+    // node list is not readable from another app's process. Scanning anyway
+    // would only produce "找不到 tailscale" noise in the log on every refresh.
+    // A phone still *reaches* a 100.x peer over that VPN — the address simply
+    // arrives in the pairing code instead of being discovered.
+    if (Platform.isAndroid || Platform.isIOS) return const <PeerInfo>[];
     final nodes = await _tailscaleNodes();
     if (nodes.isEmpty) return const <PeerInfo>[];
     final probes = nodes.map((node) async {
