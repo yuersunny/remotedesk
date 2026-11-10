@@ -3,7 +3,15 @@
 
 $ErrorActionPreference = 'Continue'
 $kit = Split-Path -Parent $PSScriptRoot
-$appDir = Join-Path $kit 'src\remotedesk\app'
+# 源码可能在两处：套件自带的快照（src\remotedesk），或发行包里并列的 source\
+$appDir = $null
+foreach ($candidate in @(
+    (Join-Path $kit 'src\remotedesk\app'),
+    (Join-Path $kit '..\..\source\app'),
+    (Join-Path $kit '..\source\app'))) {
+    if (Test-Path (Join-Path $candidate 'pubspec.yaml')) { $appDir = $candidate; break }
+}
+if (-not $appDir) { $appDir = Join-Path $kit 'src\remotedesk\app' }
 
 Write-Host ""
 Write-Host "================ 编译 Windows 原生版 ================" -ForegroundColor Cyan

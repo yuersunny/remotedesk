@@ -1,0 +1,31 @@
+# 行尾必须固定，不能靠用户的 core.autocrlf。
+#
+# .cmd / .bat：cmd.exe 按字节偏移找 goto 标签，LF-only 会定位失败；带 BOM 更糟，
+#              首行会报「'ï»¿@echo' 不是内部或外部命令」。所以这两类必须 CRLF + 无 BOM。
+# .ps1      ：反过来，必须是 CRLF + **有** BOM。Windows PowerShell 5.1 对无 BOM 的
+#              .ps1 按系统 ANSI 码页（简体中文 = GBK）解码，脚本里的中文会全部乱码，
+#              含中文路径的命令会静默跑错，报错信息本身也是乱码。
+# .sh       ：绝不能有 BOM，否则 shebang 失效，脚本无法执行。
+
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+*.ps1   text eol=crlf
+*.sh    text eol=lf
+*.command text eol=lf
+
+*.dart  text eol=lf
+*.md    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+*.kt    text eol=lf
+*.swift text eol=lf
+*.cpp   text eol=lf
+*.h     text eol=lf
+
+*.dmg   binary
+*.apk   binary
+*.zip   binary
+*.jks   binary
+*.png   binary
+*.jpg   binary

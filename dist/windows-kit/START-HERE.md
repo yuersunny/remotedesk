@@ -1,184 +1,98 @@
-# 先看这里（60 秒决定走哪条路）
+# Windows 端怎么跑
 
-这个包是 **RemoteDesk 1.0.7**：自研远程桌面，Mac / Windows / 安卓同一套 Flutter 代码。
-能力是 **画面传输 + 远端鼠标键盘控制 + 双向剪贴板同步（纯文本）**。
-
-**一条关键区别**：主控端网页版就够用，但**被控端必须是原生版**——
-浏览器没有系统输入权限，网页版只能共享画面，不能被人操作。
-
-包里有两条路，**互不影响**，可以先用 A 验证，再装 B。
+这个文件夹在发行包里位于 `installers/windows/`，完整源码在 `../../source/`。
+下面两条路，按你的需求选一条。
 
 ---
 
-## 路径 A：网页版 —— 零安装，双击就能跑
+## A. 浏览器版 —— 不用装任何东西（只能当主控）
 
-**双击 `00-RUN-WEB-NOW.cmd`**
+双击 **`00-RUN-WEB-NOW.cmd`**。
 
-- 用的是包里自带的 `node/node.exe`，不需要装 Node、不需要装 Flutter、不需要编译。
-- 会自动起两个服务（信令 8787、网页 8080）并打开 Chrome。
-- 打开后自动连上（地址默认就是本机 `ws://127.0.0.1:8787/ws`，不用填也不用点）。
-- **网页版只能"看"，不能被人远程操作**（可以当主控去操作别人）。
+它会用包内自带的 `node\node.exe` 在 `http://localhost:8080` 起一个静态服务，然后打开浏览器。
+不需要 Node，不需要 Flutter，不需要编译。
 
-> 想让 Mac 和这台 Windows 互连，看下面「两台机器怎么连」。
+打开后在页面里点「手动指定」，填**对方机器**的地址：
+
+```
+192.168.1.20            同一个 Wi-Fi
+192.168.1.20:8787       端口不同时带上
+```
+
+或者直接粘对方界面上那行配对码（`RDSK1 100.x.x.x:8787 <名字> <密码>`）。
+
+**两个必须知道的限制**：
+
+1. **只能当主控**。浏览器版能操作别人，但别人看不到、也操作不了这台机器。
+   要被控，走下面的 B 路。
+2. **页面必须开在 `localhost`**，不能通过局域网 IP 访问。Chrome 只在 localhost 或 https
+   下允许屏幕采集，用 `192.168.x.x:8080` 打开会拿不到画面。
+
+一个黑色的命令行窗口会出现——它就是 Web 服务本身，关掉窗口服务就停了。
 
 ---
 
-## 路径 B：原生 Windows 桌面版 —— 需要编译环境
+## B. 原生 exe —— 编译一次，之后和普通软件一样
 
-按顺序双击，每步都会自检并告诉你下一步：
+需要装开发工具，20 分钟左右，一次性。脚本都放在这个目录，按顺序双击：
 
-| 顺序 | 双击 | 干什么 | 耗时 |
+| 顺序 | 脚本 | 干什么 | 要多久 |
 |---|---|---|---|
-| 1 | `01-check-env.cmd` | 体检，告诉你缺什么 | 10 秒 |
-| 2 | `01b-enable-dev-mode.cmd` | 一键开「开发者模式」（弹一次 UAC，无需重启） | 10 秒 |
-| 3 | `02-install-flutter.cmd` | 装 Flutter 3.47.9（约 1.8 GB） | 6~20 分钟 |
-| 4 | `03-install-vs-buildtools.cmd` | 装 VS Build Tools + C++ 工作负载（约 4~7 GB，会弹 UAC） | 10~20 分钟 |
-| 5 | `04-build-windows.cmd` | 编译出 `remotedesk.exe` | 3~8 分钟 |
-| 6 | `05-run-windows-app.cmd` | 启动原生版 | — |
-| 7 | 展开 **高级设置**，点 **测试注入** | 验证这台机器真的能被人操作 | 2 秒 |
+| 1 | `01-check-env.cmd` | 检查现在缺什么，只读不改 | 5 秒 |
+| 2 | `01b-enable-dev-mode.cmd` | 打开 Windows「开发者模式」（Flutter 要建符号链接，不开会失败） | 10 秒 |
+| 3 | `03-install-vs-buildtools.cmd` | 装 Visual Studio Build Tools + C++ 桌面开发组件 | 10–20 分钟 |
+| 4 | `02-install-flutter.cmd` | 装 Flutter SDK（解压到 `%USERPROFILE%\flutter`） | 5–10 分钟 |
+| 5 | `04-build-windows.cmd` | 编译，产物在 `..\..\source\app\build\windows\x64\runner\Release\` | 3–8 分钟 |
+| 6 | `05-run-windows-app.cmd` | 启动刚编出来的 exe | — |
 
-### 第 7 步不能跳
+**第 3、4 步装完必须关掉窗口重开**，PATH 才会生效。装完可以再跑一次 `01-check-env.cmd` 确认全绿。
 
-原生版启动后，左下角有一行状态：
-
-- **「输入注入就绪 · 虚拟桌面 1920×1080」** → 点「**测试注入**」。
-  光标会向右跳 3 px 再复位；会话日志里出现
-  **「注入自检通过：光标动了（本机已可被远程控制）」** 才算真的能被远程操作。
-- **「输入注入不可用 · …」** → 把后面那句原因原样发回来，别继续往下试。
-
-> 为什么要单独点一下：注入失败在 Windows 上**不报错**，只是没反应。
-> 不点这一步，「连上了但鼠标不动」会被误判成网络或信令问题，白查半天。
-
-**装完 03 之后必须开一个新的命令行窗口**，旧的窗口读不到新的 PATH。
-
-### ⚠️ 第 2 步（开发者模式）为什么不能跳
-
-Flutter 在 Windows 上给插件建符号链接，没开开发者模式会在 `pub get` 阶段报：
-
-```
-Building with plugins requires symlink support.
-```
-
-**看着像依赖/网络问题，其实是系统权限**，折腾 pub 镜像不会好。
-`01b-enable-dev-mode.cmd` 会自动提权写注册表，点一下 UAC 的「是」就完事，不用重启、不用点设置。
-
-手动开也行：设置 → 隐私和安全性 → 开发者选项 → 「开发人员模式」，或 `start ms-settings:developers`。
-
-`01-check-env.cmd` 和 `04-build-windows.cmd` 都会先检查这一项。
-
-### ⚠️ 编译报 C2220 / C4819（中文 Windows 专有）
-
-如果编译到 `[3/3] flutter build windows` 时报：
-
-```
-...\.plugin_symlinks\flutter_webrtc\common\csp\rfl_media_stream.cc(1,1):
-error C2220: 以下警告被视为错误
-... warning C4819: 该文件包含不能在当前代码页(936)中表示的字符
-```
-
-这不是你的环境坏了，也不是依赖没装好，是**编译器按 GBK 读 UTF-8 源码**：
-
-- 中文 Windows 的 ANSI 代码页是 936，MSVC 默认按它解码每个 `.cc`；
-- 第三方插件（`flutter_webrtc`）的源码是 UTF-8，注释里带非 ASCII 字符；
-- Flutter 模板又给所有目标加了 `/WX`（警告当错误），于是这条纯编码提示直接中断编译。
-
-`chcp 65001` 解决不了（它改的是控制台代码页，不是编译器读文件用的 ANSI 代码页）。
-
-**本包已修**：`app\windows\CMakeLists.txt` 里给 MSVC 加了 `/utf-8 /wd4819`。
-如果你手上是更早的包，手动补两行即可（`app\windows\CMakeLists.txt`，
-在 `add_definitions(-DUNICODE -D_UNICODE)` 后面）：
-
-```cmake
-if(MSVC)
-  add_compile_options(/utf-8 /wd4819)
-endif()
-```
-
-改完直接重跑 `04-build-windows.cmd`，不用 `flutter clean`。
+编译完的 `Release\` 整个文件夹就是绿色版，可以拷到任何 Windows 机器上直接跑
+（目标机器可能需要 VC++ 运行库，微软官网下 `vc_redist.x64.exe`）。
 
 ---
 
-## 两台机器怎么连
+## 常见问题
 
-**两台都打开，什么都不用填。**
+**双击 .cmd 一闪就没了**
+说明脚本在 `pause` 之前就退出了。在这个目录按住 Shift 右键 →「在此处打开 PowerShell 窗口」，
+手动敲 `.\04-build-windows.cmd`，就能看到完整的报错。
 
-**1. 被控那台：把开关打开**
+**防火墙弹窗**
+第一次运行会问是否允许网络访问，勾「专用网络」。不允许的话对方连不上 8787。
 
-- 打开 **「允许远程控制」**，密码会自动生成
-- 那台机器就一直能被连了，不用再做别的
+**连上了，但点不动某些窗口**
+Windows 从 Vista 起禁止低权限进程向**以管理员身份运行**的窗口发送输入（UIPI 隔离）。
+任务管理器、注册表编辑器这类提权窗口就是这样。解法只有两个：把 RemoteDesk 也用管理员身份运行，
+或者不要控制那些窗口。这是系统限制，任何远程软件都绕不过去。
 
-**2. 操作那台：点一下对方的名字**
+**编译报 `C2220` 或 `C4819`**
+中文 Windows 的 ANSI 代码页是 936，而插件源码是 UTF-8，Flutter 模板又开了「警告即错误」。
+本仓库已经在 `app/windows/CMakeLists.txt` 里加了 `/utf-8 /wd4819`。
+如果你从别处拿到的是旧版本代码，把这个补上即可。注意 `chcp 65001` **没用**——
+它只改控制台，不改编译器读文件用的代码页。
 
-- 「连接另一台电脑」里会自动出现对方，点它 → 画面出来
-- 第一次连会有一次密码提示（对方开着「允许远程控制」时）；
-  连过一次就记住，以后都是一点就进
+**编译报找不到 `pubspec.yaml`**
+`04-build-windows.cmd` 会在两个位置找源码：套件自带的 `src\remotedesk`，或者发行包里并列的
+`source\`。两个都没有，说明压缩包没解压完整。
 
-没有 IP，没有服务器地址，也不用决定谁当服务器 ——
-每台都给自己当中转，连别人时临时借用对方那台，握完手就是点对点直连。
-
-**列表是空的怎么办（按顺序试）**
-
-1. 两台在同一个 Wi-Fi，或同一个 Tailscale 网络里
-2. 让对方先打开程序 —— 只有开着的那台才会出现在列表里
-3. 用配对码：对方那台「这台电脑」卡片上有一行字，点一下即复制：
-
-   ```
-   RDSK1 100.101.102.103:8787 mac-mini 7Q4WT9
-   ```
-
-   粘进「或者粘贴对方给你的配对码」，点「连」。这行字里带着名字、密码和地址，
-   对网络没有别的要求，只要能互通就行。
-
-★ 两台的名字不能相同。默认名取自机器名（`mac-mini` / `win-pc`），一般不会撞。
-★ 都不行时，「手动指定（找不到的时候用）」里可以填 IP。
-
-**Windows 作为被控端：一定要放行防火墙**
-
-两件事都归防火墙管，漏了表现不同：
-
-| 漏掉 | 现象 |
-|---|---|
-| 8787 入站 | 对方能看见这台，但一点就失败 |
-| WebRTC 的 UDP 入站 | 连上了，但**黑屏 / 鼠标不动** |
-
-第一次运行 `remotedesk.exe` 会弹「是否允许通过防火墙」，**勾「专用网络」并允许**。
-漏点了就用管理员 PowerShell 补一条：
-
-```powershell
-New-NetFirewallRule -DisplayName "RemoteDesk" -Direction Inbound `
-  -Program "C:\path\to\remotedesk.exe" -Action Allow
-```
-
-**连不上先看窗口顶部**
-
-连不上时最上面会有一段红字说明原因。
-再看「高级设置 › 打开日志目录」，里面 `app-*.log` 有每一步的结果：
-
-| 平台 | 日志位置 |
-|---|---|
-| Windows | `%LOCALAPPDATA%\RemoteDesk\logs\app-YYYY-MM-DD.log` |
-| macOS | `~/Library/Logs/RemoteDesk/app-YYYY-MM-DD.log` |
-
-日志能分清「根本没连上服务器」和「连上了但被拒绝」—— 这两件事以前看起来一模一样。
-
-### 画面上只有**一个**鼠标箭头，这是对的
-
-主控端看到的箭头是本地画的，被控端的系统光标已经被明确排除在画面之外
-（`getDisplayMedia` 的 `cursor: 'never'`）。以前只对网页版设了这个，桌面端漏了，
-于是被控端的箭头留在画面里、主控又画了一个 —— 点一下鼠标就出现「两个鼠标」。
-
-代价是看不到对方的形状变化（文本竖线、拉边框的双箭头），换来的是跟手不延迟。
-如果哪天想改回「显示对方光标」，改 `app/lib/src/screen_capture.dart` 里
-`CaptureRequest.showCursor` 为 `true` 即可（会重新变卡 80~500ms）。
+**`flutter pub get` 失败，报符号链接错误**
+第 2 步的开发者模式没开，或者开了没重启终端。
 
 ---
 
-## 出问题先看这两处
+## 这个目录里还有什么
 
-- `01-check-env.cmd` 的输出（会直接告诉你缺什么、该跑哪个脚本）
-- 网页左下角的「会话日志」（连接、呼叫、SDP/ICE、连接状态都打在里面）
+```
+tools\check-env.ps1          环境体检
+tools\install-vs-buildtools.ps1
+tools\install-flutter.ps1
+tools\enable-dev-mode.ps1
+tools\build-windows.ps1      真正的编译逻辑
+tools\serve.mjs              A 路用的静态服务（含 localhost 安全上下文说明）
+tools\lan-info.mjs           打印本机各网卡地址，方便告诉对方填哪个
+node\node.exe                Node 运行时（83 MB，A 路靠它，不用单独装 Node）
+web-preview\                 A 路用的网页版产物（flutter build web 的结果）
+```
 
-更细的说明在 `README-WINDOWS.md`；给 AI 助手看的上下文在 `AI-HANDOFF.md`。
-
-**先看一眼 `BUILD-INFO.txt`**（版本号 / 打包时间 / git 提交）。
-出问题时第一件事是确认跑的是哪一版，不然会拿旧包的现象去查新代码。
+删掉 `node\` 和 `web-preview\` 不影响 B 路，能省 100 MB。

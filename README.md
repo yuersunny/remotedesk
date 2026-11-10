@@ -1,6 +1,50 @@
 # RemoteDesk
 
-自用跨平台远程控制工具（macOS / Windows / Android），支持任意公网穿透。
+跨平台远程桌面：**macOS / Windows / Android 一套代码**，局域网点一下就连，跨网络走 Tailscale 或自建中继。
+
+不需要配服务器、不需要记 IP、不需要判断"谁控制谁"——每台机器自己监听，拨号时临时连对方的端口。
+真正传画面的是 WebRTC（P2P 直连优先，打不通回落 TURN 中继，DTLS-SRTP 加密），信令只转发不解析。
+
+---
+
+## 一、只想用，不想写代码
+
+去 [Releases](../../releases) 下对应平台的包，或者用发行 zip 里的 `installers/`：
+
+| 平台 | 文件 | 说明 |
+|---|---|---|
+| macOS 13+ | `RemoteDesk-1.0.7-macos-universal.dmg` | 通用二进制（Intel + Apple Silicon），双击装 |
+| Android 7.0+ | `RemoteDesk-1.0.7-android-arm64.apk` | 手机**只能当主控**（手机操作电脑） |
+| Windows 10/11 | **无预编译包** | 见下方说明，需在本机编译一次 |
+
+用法三步：两台机器都打开 → 同一个 Wi-Fi 下会自动出现在列表里 → 点一下就连上。
+列表里没有就用「配对码」：被控端界面上那行字，复制粘贴过去。
+
+手势、快捷键、排查步骤见 [`GETTING-STARTED.md`](GETTING-STARTED.md)。
+
+### Windows 为什么没有 exe
+
+本项目在 macOS 上开发，**Flutter 不能交叉编译到 Windows**（需要在 Windows 上跑 MSVC）。
+两条路：
+
+1. **浏览器版，开箱即用**（推荐先试这个）：`installers/windows/` 里的 `00-RUN-WEB-NOW.cmd`，
+   双击后用 Chrome 打开，功能和桌面版基本一致，不用装任何开发工具。
+2. **编译原生 exe**：同一目录下 `03-install-vs-buildtools.cmd` → `02-install-flutter.cmd` →
+   `04-build-windows.cmd`，脚本会自动装 VS Build Tools 和 Flutter，全程约 20 分钟、一次性。
+
+---
+
+## 二、想改代码
+
+```bash
+git clone <本仓库>
+cd remotedesk/app
+flutter pub get
+flutter run -d macos      # 或 -d windows / -d chrome / 安卓设备
+```
+
+代码组织、三端构建、测试、以及"想改某个功能该动哪个文件"，见 [`DEVELOPING.md`](DEVELOPING.md)。
+线格式（DataChannel 上到底发了什么字节）见 [`docs/protocol.md`](docs/protocol.md)。
 
 ## 架构
 

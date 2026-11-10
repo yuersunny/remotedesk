@@ -37,3 +37,13 @@ dist/windows-kit/src/
 dist/windows-kit/web-preview/
 dist/windows-kit/node/
 dist/windows-kit/BUILD-INFO.txt
+
+# 发行包的展开目录（pack-release.sh 每次重建）
+dist/release/
+
+# --- 安卓签名密钥 ---
+# 本仓库是公开的：release key 一旦随代码公开，任何人都能用它签一个"覆盖安装"的
+# APK。密钥只留在构建机上（备份在 ~/.remotedesk-signing/）。缺了不会导致构建失败，
+# 会退回 debug 签名。详见 app/android/key.properties。
+app/android/key.properties
+app/android/keystore/
