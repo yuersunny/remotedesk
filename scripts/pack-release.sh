@@ -42,7 +42,8 @@ if [ -f "$ROOT/docs/使用说明书.md" ]; then
 fi
 MANUAL_PDF="$ROOT/dist/RemoteDesk-$VERSION-使用说明书.pdf"
 if [ -f "$MANUAL_PDF" ]; then
-  cp "$MANUAL_PDF" "$OUT/"
+  # 包内去掉版本号：收包的人看到的是"使用说明书.pdf"，与 README-FIRST 里写的一致。
+  cp "$MANUAL_PDF" "$OUT/使用说明书.pdf"
 else
   echo "  [!] 没有 $MANUAL_PDF，包里只带 Markdown 版（先跑 scripts/build-manual.py）" >&2
 fi
@@ -117,7 +118,11 @@ TXT
 # ---- 5. 打包 ----------------------------------------------------------------
 echo "==> 打包"
 rm -f "$ZIP"
-( cd "$ROOT/dist/release" && zip -r -q -X "$ZIP" "RemoteDesk-$VERSION" -x '*.DS_Store' -x '__MACOSX/*' )
+# 用 bsdtar 而不是 zip。Apple 自带的 Info-ZIP 3.0 去掉了 -UN=UTF8，打中文文件名
+# （"使用说明书.pdf"）时不写 UTF-8 标志位，别人在 Windows 上解压会变成
+# "Σ╜┐τö¿Φ»┤µÿÄΣ╣ª.pdf" 这种乱码。bsdtar 会按需置 0x800 标志。
+( cd "$ROOT/dist/release" && bsdtar --no-xattrs -a -cf "$ZIP" \
+    --exclude '*.DS_Store' --exclude '__MACOSX' "RemoteDesk-$VERSION" )
 
 # ---- 6. 自检 ----------------------------------------------------------------
 echo
