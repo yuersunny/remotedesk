@@ -121,6 +121,53 @@ class ScreenCaptureService {
   }
 }
 
+/// Pick the source to capture, preferring the one used last time.
+///
+/// Display ids are not stable across a replug or a power cycle. Windows tears
+/// the output down and re-creates it under a new device name
+/// (`\\.\DISPLAY2` → `\\.\DISPLAY1`), so an id remembered from an earlier
+/// session can point at an output that no longer exists. Asking the capturer
+/// for that id yields a session that connects and shows **no picture** — the
+/// pointer moves, the screen stays black. That is why [previousId] is only
+/// honoured while it is still present in [sources].
+///
+/// Comparison is by id, never by name: Windows reuses names like "Screen 1"
+/// across a replug, so a name match proves nothing about the underlying output.
+///
+/// Returns `null` when there is nothing to capture.
+CaptureSource? pickCaptureSource(
+  List<CaptureSource> sources,
+  String? previousId,
+) {
+  if (sources.isEmpty) return null;
+  if (previousId != null) {
+    for (final s in sources) {
+      if (s.id == previousId) return s;
+    }
+  }
+  for (final s in sources) {
+    if (s.isScreen) return s;
+  }
+  return sources.first;
+}
+
+/// 会话进行中，正在采集的那个输出还在不在系统里？
+///
+/// 返回 true 表示"会话正用着的源已经从系统消失"——典型场景是显示器被
+/// 断电或换线：Windows 把 `\\.\DISPLAY2` 拆掉，再按 `\\.\DISPLAY1` 重建一个，
+/// 于是那条 MediaStream 再也不会产生新帧。表现为**画面全黑、但会话正常**
+/// （鼠标还能动、剪贴板还能同步），因为出问题的是画面源，不是连接。
+///
+/// 空列表一律当作"不知道"，绝不当成"源没了"：枚举失败（权限、插件异常、
+/// 平台不支持）在桌面上是家常便饭，误判会导致正在进行的采集被反复重启。
+bool captureSourceGone(List<CaptureSource> sources, String? currentId) {
+  if (currentId == null || sources.isEmpty) return false;
+  for (final s in sources) {
+    if (s.id == currentId) return false;
+  }
+  return true;
+}
+
 /// The `video` half of the `getDisplayMedia` constraints.
 ///
 /// Top-level and pure so its shape can be asserted in a test — two of the three

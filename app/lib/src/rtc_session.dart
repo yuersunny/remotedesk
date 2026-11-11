@@ -348,12 +348,58 @@ class RtcSession {
   bool _videoReceiverAdded = false;
   bool _tracksAttached = false;
 
+  /// The sender that owns the outgoing video track.
+  ///
+  /// Held so the capture can be swapped in place after it breaks: a display
+  /// that is unplugged or powered off tears the OS capture session down, and
+  /// without a handle on the sender the only cure is hanging up and calling
+  /// again — which is exactly what the black-screen complaint felt like.
+  RTCRtpSender? _videoSender;
+
   Future<void> _attachTracks(RTCPeerConnection pc, MediaStream stream) async {
     if (_tracksAttached) return;
     _tracksAttached = true;
     for (final track in stream.getVideoTracks()) {
-      await pc.addTrack(track, stream);
+      _videoSender = await pc.addTrack(track, stream);
     }
+  }
+
+  /// Target side: put a freshly captured track on the wire, no renegotiation.
+  ///
+  /// `replaceTrack` keeps the same m-line and the same RTP stream, so the
+  /// controller never notices anything except that pictures started arriving
+  /// again. Renegotiating instead would need an offer/answer round this
+  /// pipeline deliberately does not implement.
+  ///
+  /// Returns false when there is no sender yet (offer not applied), in which
+  /// case the caller keeps the new stream for the next session.
+  Future<bool> replaceLocalStream(MediaStream stream) async {
+    final sender = _videoSender;
+    final tracks = stream.getVideoTracks();
+    if (sender == null || tracks.isEmpty) return false;
+
+    final previous = _localStream;
+    try {
+      await sender.replaceTrack(tracks.first);
+    } catch (e) {
+      _log('替换采集轨道失败: $e');
+      return false;
+    }
+
+    _localStream = stream;
+    try {
+      localRenderer.srcObject = stream;
+    } catch (_) {}
+
+    if (previous != null && previous != stream) {
+      for (final track in previous.getTracks()) {
+        try {
+          await track.stop();
+        } catch (_) {}
+      }
+    }
+    _log('已替换采集轨道（未重新协商）');
+    return true;
   }
 
   /// Target side: hand over a stream captured *after* the pipeline started.

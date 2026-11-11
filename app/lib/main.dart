@@ -218,6 +218,14 @@ class _HomePageState extends State<HomePage> implements MobileHost {
   SessionStats _stats = SessionStats.empty;
   Timer? _statsTimer;
 
+  /// Target only: watches whether the display being captured still exists.
+  /// Separate from [_statsTimer] because it is far more expensive (it asks the
+  /// plugin to enumerate every screen) and must not run on the controller.
+  Timer? _sourceWatchTimer;
+
+  /// Guards against two recoveries overlapping when one capture attempt is slow.
+  bool _recovering = false;
+
   /// Local input injector. Only the target ever uses it; probing it at startup
   /// puts any "cannot inject here" reason in the log before the first session
   /// rather than after a mysteriously dead mouse.
@@ -286,6 +294,17 @@ class _HomePageState extends State<HomePage> implements MobileHost {
 
   List<CaptureSource> _sources = const <CaptureSource>[];
   CaptureRequest _request = const CaptureRequest();
+
+  /// True when the user picked a capture source in 高级设置 by hand.
+  ///
+  /// Only a manual pick survives the process. An auto-resolved source is
+  /// re-enumerated on every session, because display topology is not stable:
+  /// unplugging the monitor, powering it off, or moving the cable to another
+  /// machine makes Windows tear down the output and re-create it under a new
+  /// device name (`\\.\DISPLAY2` → `\\.\DISPLAY1`). The old id then points at
+  /// an output that no longer exists and the session comes up **connected with
+  /// no picture** — pointer works, screen stays black.
+  bool _sourceChosenByUser = false;
   int _frameRate = 30;
   int _maxHeight = 1080;
 
@@ -796,6 +815,7 @@ class _HomePageState extends State<HomePage> implements MobileHost {
     try {
       await session.start(localStream: stream);
       _startStatsTimer();
+      _startSourceWatch();
     } catch (e) {
       _log('建立被控会话失败: $e');
       setState(() => _phase = SessionPhase.failed);
@@ -937,9 +957,68 @@ class _HomePageState extends State<HomePage> implements MobileHost {
     });
   }
 
+  /// 被控端：盯着"正在采集的那块屏还在不在"。
+  ///
+  /// 显示器断电或换线时，Windows 会销毁当前输出、在新编号上重建一个，DXGI
+  /// 那条采集流从此不出帧。症状是画面黑着、但会话完全正常——鼠标还能动、
+  /// 剪贴板还同步，所以看起来像"画面断了"，其实是"源没了"。
+  ///
+  /// 发现源消失就把采集换到新输出上（`replaceTrack`，不重新协商），画面几秒
+  /// 内自己回来，不用断开重连。检查间隔 5 秒：枚举一次要过插件拿缩略图，
+  /// 太频繁会让被控端白白耗电，而换显示器这种事本来也不差这几秒。
+  void _startSourceWatch() {
+    _sourceWatchTimer?.cancel();
+    _sourceWatchTimer =
+        Timer.periodic(const Duration(seconds: 5), (timer) async {
+      final session = _session;
+      if (session == null || !mounted) return;
+      if (session.role != SessionRole.target) return;
+      if (_recovering) return;
+      final current = _request.sourceId;
+      if (current == null) return;
+      final sources = await _capture.listSources();
+      if (!captureSourceGone(sources, current)) return;
+      final next = pickCaptureSource(sources, null);
+      if (next == null) return;
+      _recovering = true;
+      try {
+        await _recoverCapture(session, next);
+      } finally {
+        _recovering = false;
+      }
+    });
+  }
+
+  /// 把采集切到 [next]，全程不动会话。
+  Future<void> _recoverCapture(RtcSession session, CaptureSource next) async {
+    final request = _request.copyWith(sourceId: next.id);
+    _log('⚠ 原采集源已从系统消失（显示器断电或换线？），'
+        '改用 ${next.name} [${next.id}] 并重采');
+    final MediaStream stream;
+    try {
+      stream = await _capture.capture(request);
+    } catch (e) {
+      // 到这一步就不是代码能救的了：连新输出都采不到，只能如实说明，
+      // 别让用户对着黑屏猜。
+      _log('重新采集失败: $e —— 画面会保持黑屏，可断开重连再试');
+      return;
+    }
+    _request = request;
+    if (await session.replaceLocalStream(stream)) {
+      _log('画面已恢复（采集源 ${next.name}）');
+      return;
+    }
+    // 还没走到 addTrack（offer 未到），把新流直接交给会话，下次挂轨就用它。
+    await session.useLocalStream(stream);
+    _log('采集已重建，等会话挂轨后生效');
+  }
+
   Future<void> _teardownSession({bool notifyPeer = true}) async {
     _statsTimer?.cancel();
     _statsTimer = null;
+    _sourceWatchTimer?.cancel();
+    _sourceWatchTimer = null;
+    _recovering = false;
     _inputSub?.cancel();
     _inputSub = null;
     await _clipboard.stop();
@@ -1309,21 +1388,32 @@ class _HomePageState extends State<HomePage> implements MobileHost {
   /// That is exactly how Windows behaved as a target while macOS worked.
   ///
   /// An explicit choice made in 高级设置 always wins, so this only fills a gap.
+  ///
+  /// The auto-resolved source is **not** cached across sessions: see
+  /// [_sourceChosenByUser]. Caching it means a display change (unplug, power
+  /// off, cable moved to another machine) leaves us asking for an output id
+  /// the system has already destroyed — the session connects and never gets a
+  /// frame.
   Future<CaptureRequest> _resolveCaptureRequest() async {
-    if (kIsWeb || _request.sourceId != null) return _request;
+    if (kIsWeb) return _request;
+    if (_request.sourceId != null && _sourceChosenByUser) return _request;
     try {
       final sources = await _capture.listSources();
-      if (sources.isEmpty) {
+      final previous = _request.sourceId;
+      final screen = pickCaptureSource(sources, previous);
+      if (screen == null) {
         _log('⚠ 没有枚举到可采集的屏幕，可能缺少屏幕录制权限');
         return _request;
       }
-      final screen = sources.firstWhere(
-        (s) => s.isScreen,
-        orElse: () => sources.first,
-      );
       _request = _request.copyWith(sourceId: screen.id);
       if (mounted) setState(() => _sources = sources);
-      _log('采集源: $screen');
+      final dropped = previous != null && previous != screen.id;
+      // 名字（"Screen 1"）在换接口后会被系统重新分配，只有 id 才是稳定的
+      // 身份。两边都写进日志，才分得清"抓错源"和"系统根本没画面"。
+      _log(dropped
+          ? '⚠ 采集源已失效（显示器编号变了？），改用: $previous → '
+              '${screen.name} [${screen.id}]'
+          : '采集源: ${screen.name} [${screen.id}]');
     } catch (e) {
       _log('枚举采集源失败: $e');
     }
@@ -1333,7 +1423,22 @@ class _HomePageState extends State<HomePage> implements MobileHost {
   Future<void> _refreshSources() async {
     final sources = await _capture.listSources();
     if (!mounted) return;
-    setState(() => _sources = sources);
+    setState(() {
+      _sources = sources;
+      // 下拉框的 value 必须落在 items 里，否则 DropdownButtonFormField 直接
+      // 断言失败、整块界面崩掉。显示器换过之后旧 id 会从列表里消失，这里
+      // 跟着清掉，交给下一次会话重新解析。
+      final current = _request.sourceId;
+      if (current != null && !sources.any((s) => s.id == current)) {
+        _request = CaptureRequest(
+          width: _request.width,
+          height: _request.height,
+          frameRate: _request.frameRate,
+          showCursor: _request.showCursor,
+        );
+        _sourceChosenByUser = false;
+      }
+    });
     _log(sources.isEmpty
         ? '当前平台由系统/浏览器弹窗选择采集源'
         : '发现 ${sources.length} 个可采集源');
@@ -2099,8 +2204,11 @@ class _HomePageState extends State<HomePage> implements MobileHost {
                                     overflow: TextOverflow.ellipsis),
                               ),
                           ],
-                          onChanged: (v) => setState(
-                              () => _request = _request.copyWith(sourceId: v)),
+                          onChanged: (v) => setState(() {
+                            _request = _request.copyWith(sourceId: v);
+                            // 手动选过就固定用它，不再自动重新解析。
+                            _sourceChosenByUser = v != null;
+                          }),
                         ),
                 ),
                 const SizedBox(width: 8),
