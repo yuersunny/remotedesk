@@ -14,7 +14,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
-VER="${1:-1.0.0}"
+DEFAULT_VER="$(awk '/^version:/{print $2}' "$ROOT/app/pubspec.yaml")"
+DEFAULT_VER="${DEFAULT_VER%%+*}"
+VER="${1:-$DEFAULT_VER}"
 
 APP="$ROOT/app/build/macos/Build/Products/Release/remotedesk.app"
 OUT="$ROOT/dist/RemoteDesk-$VER-macos-universal.dmg"

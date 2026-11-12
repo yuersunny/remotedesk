@@ -51,7 +51,7 @@ const List<Map<String, dynamic>> kDefaultIceServers = <Map<String, dynamic>>[
 /// Shown in the phone UI. Kept in step with `version:` in pubspec.yaml by hand:
 /// reading it back at runtime would pull in a plugin and a native call just to
 /// print a string.
-const String kAppVersion = '1.0.7';
+const String kAppVersion = '1.0.8';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();

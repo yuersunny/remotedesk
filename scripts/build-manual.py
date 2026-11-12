@@ -21,8 +21,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "docs" / "使用说明书.md"
-OUT_HTML = ROOT / "dist" / "RemoteDesk-1.0.7-使用说明书.html"
-OUT_PDF = ROOT / "dist" / "RemoteDesk-1.0.7-使用说明书.pdf"
+# 版本号只在 pubspec.yaml 里写一次。文件名、封面、标题都从这里派生，
+# 否则换个版本就会出现"包是 1.0.8、封面印着 1.0.7"这种没人会当场发现的事。
+VERSION = re.search(
+    r"(?m)^version:\s*([^+]+)",
+    (ROOT / "app" / "pubspec.yaml").read_text(encoding="utf-8"),
+).group(1).strip()
+OUT_HTML = ROOT / "dist" / f"RemoteDesk-{VERSION}-使用说明书.html"
+OUT_PDF = ROOT / "dist" / f"RemoteDesk-{VERSION}-使用说明书.pdf"
 
 CHROME_CANDIDATES = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -199,11 +205,11 @@ def parse(md: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     return toc, body
 
 
-COVER = """
+COVER = f"""
 <section class="cover">
   <div class="cover-top">
     <div class="brand">REMOTE<span>DESK</span></div>
-    <div class="version">v1.0.7</div>
+    <div class="version">v{VERSION}</div>
   </div>
 
   <h1>使用说明书</h1>
@@ -402,7 +408,7 @@ def build_html(preface, toc, body) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RemoteDesk 使用说明书 v1.0.7</title>
+<title>RemoteDesk 使用说明书 v{VERSION}</title>
 <style>{CSS}</style>
 </head>
 <body>

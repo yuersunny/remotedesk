@@ -13,7 +13,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KIT="$ROOT/dist/windows-kit"
 SNAP="$KIT/src/remotedesk"
-VERSION="${1:-m2.2}"
+DEFAULT_VER="$(awk '/^version:/{print $2}' "$ROOT/app/pubspec.yaml")"
+DEFAULT_VER="${DEFAULT_VER%%+*}"
+VERSION="${1:-$DEFAULT_VER}"
 ZIP="$ROOT/dist/remotedesk-windows-kit-$VERSION.zip"
 
 if [ ! -d "$KIT" ]; then

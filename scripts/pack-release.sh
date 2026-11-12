@@ -9,7 +9,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${1:-1.0.7}"
+DEFAULT_VER="$(awk '/^version:/{print $2}' "$ROOT/app/pubspec.yaml")"
+DEFAULT_VER="${DEFAULT_VER%%+*}"
+VERSION="${1:-$DEFAULT_VER}"
 DMG="$ROOT/dist/RemoteDesk-$VERSION-macos-universal.dmg"
 APK="$ROOT/dist/RemoteDesk-$VERSION-android-arm64.apk"
 KIT="$ROOT/dist/windows-kit"
@@ -99,7 +101,7 @@ cat > "$OUT/README-FIRST.txt" <<TXT
 RemoteDesk $VERSION
 
 直接用
-  00  使用说明书.pdf                                          ★ 先看这个（17 页，可打印）
+  00  使用说明书.pdf                                          ★ 先看这个（可打印）
   01  installers/RemoteDesk-$VERSION-macos-universal.dmg      macOS 13+（Intel / Apple Silicon）
   02  installers/RemoteDesk-$VERSION-android-arm64.apk        Android 7.0+，手机当主控
   03  installers/windows/START-HERE.md                        Windows：浏览器版免安装，或一键编译

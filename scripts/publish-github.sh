@@ -7,7 +7,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="${1:-remotedesk}"
-VERSION="${2:-1.0.7}"
+DEFAULT_VER="$(awk '/^version:/{print $2}' "$ROOT/app/pubspec.yaml")"
+DEFAULT_VER="${DEFAULT_VER%%+*}"
+VERSION="${2:-$DEFAULT_VER}"
 TAG="v$VERSION"
 cd "$ROOT"
 
@@ -76,7 +78,7 @@ git push -u origin HEAD
 
 # ---- 4. Release -------------------------------------------------------------
 # GitHub 的 Release 资产名不支持非 ASCII：中文会被洗成连字符，
-# "RemoteDesk-1.0.7-使用说明书.pdf" 上传后变成 "RemoteDesk-1.0.7-.pdf"。
+# "RemoteDesk-<版本>-使用说明书.pdf" 上传后中文会被洗掉，只剩一串连字符。
 # 所以上传前复制一份英文名的副本，原文件留着（打包进 zip 时仍用中文名）。
 MANUAL_UP="dist/RemoteDesk-$VERSION-manual-zh.pdf"
 if [ -f "dist/RemoteDesk-$VERSION-使用说明书.pdf" ]; then
@@ -102,7 +104,7 @@ cat > "$NOTES" <<TXT
 
 | 平台 | 文件 |
 |---|---|
-| 说明书 | \`RemoteDesk-$VERSION-manual-zh.pdf\`（17 页，可打印，**建议先看**） |
+| 说明书 | \`RemoteDesk-$VERSION-manual-zh.pdf\`（可打印，**建议先看**） |
 | macOS 13+ | \`RemoteDesk-$VERSION-macos-universal.dmg\`（Intel + Apple Silicon 通用） |
 | Android 7.0+ | \`RemoteDesk-$VERSION-android-arm64.apk\`（手机只能当主控） |
 | Windows | 无预编译包，见下方说明 |
@@ -122,10 +124,19 @@ cat > "$NOTES" <<TXT
 
 ## 这一版
 
-双向剪贴板同步（纯文本，上限 160 KB）；修 macOS 的 ⌘ 在 Windows 上被当成 Win 键
-（⌘C 变成 Win+C）导致「从 Mac 复制到 Windows 不生效」。
+- **一台被控机可以同时被多台设备连接**。被控端列出「N 台设备正在看这台电脑」，
+  可逐个「断开」。多人同时操作时鼠标会互相抢，要稳定操作只留一个人。
+- **被控端顶部写明「能不能从外面连」**：绿色「出门也能连」/ 橙色「只能在同一个
+  Wi-Fi 里连」，点「怎么连」展开三步 Tailscale 引导。人在外面手机用配对码即可。
+- **手机端**：放大后右下角常驻「还原」；连不上时可「停止等待」回列表换一台，
+  不用退出 App；拨号 25 秒超时自动判失败。
+- 修 Windows 被控端关掉显示器后画面全黑、断开重连也回不来。
+- 电脑端界面收敛：「高级设置」改「更多设置」并默认折叠，去掉实现术语。
 
-**注意**：跨机剪贴板要两端都是这一版才生效。
+说明书同步更新（新增 4.4 网络状态条、5.6 多台设备同时看、手机端退出与还原）。
+
+这一版没有改动通信协议，旧版仍能连上；但**多设备同时连、状态条、手机端还原与停止**
+这些新行为，要两端都更新到这一版才有。
 
 详见 [CHANGELOG.md](CHANGELOG.md)。
 TXT

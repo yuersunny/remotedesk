@@ -13,16 +13,16 @@
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| macOS 13+ | `RemoteDesk-1.0.7-macos-universal.dmg` | 通用二进制（Intel + Apple Silicon），双击装 |
-| Android 7.0+ | `RemoteDesk-1.0.7-android-arm64.apk` | 手机**只能当主控**（手机操作电脑） |
+| macOS 13+ | `RemoteDesk-1.0.8-macos-universal.dmg` | 通用二进制（Intel + Apple Silicon），双击装 |
+| Android 7.0+ | `RemoteDesk-1.0.8-android-arm64.apk` | 手机**只能当主控**（手机操作电脑） |
 | Windows 10/11 | **无预编译包** | 见下方说明，需在本机编译一次 |
 
 用法三步：两台机器都打开 → 同一个 Wi-Fi 下会自动出现在列表里 → 点一下就连上。
 列表里没有就用「配对码」：被控端界面上那行字，复制粘贴过去。
 
 **第一次用、或者要交给不懂技术的人，看 [`docs/使用说明书.md`](docs/使用说明书.md)**——
-12 章，讲清了安装、授权、IP 与端口、配对码、失败排查。排好版的 17 页 PDF 在
-[Releases](../../releases/latest) 里（`RemoteDesk-1.0.7-manual-zh.pdf`），可直接打印或发微信；
+12 章，讲清了安装、授权、IP 与端口、配对码、失败排查。排好版的 PDF 在
+[Releases](../../releases/latest) 里（`RemoteDesk-1.0.8-manual-zh.pdf`），可直接打印或发微信；
 也可以跑 `python3 scripts/build-manual.py` 自己生成。手势、快捷键、速查表见
 [`GETTING-STARTED.md`](GETTING-STARTED.md)。
 
