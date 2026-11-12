@@ -51,8 +51,11 @@ fi
 SSH_URL="git@github.com:$OWNER/$REPO.git"
 
 # 注意：认证成功时 ssh -T 的退出码是 1（GitHub 不提供 shell），不能拿退出码判断。
-if ! ssh -o ConnectTimeout=10 -o BatchMode=yes -T git@github.com 2>&1 \
-     | grep -q "successfully authenticated"; then
+# 更阴的是脚本开了 `set -o pipefail`：直接写 `ssh ... | grep -q ...` 时，
+# 哪怕 grep 匹配上了，ssh 的退出码 1 也会让整条管道判失败 —— 于是明明认证是通的，
+# 预检永远报错。所以先 `|| true` 把输出收进变量，再单独对文本做判断。
+SSH_PROBE="$(ssh -o ConnectTimeout=10 -o BatchMode=yes -T git@github.com 2>&1 || true)"
+if ! printf '%s' "$SSH_PROBE" | grep -q "successfully authenticated"; then
   echo "[x] git@github.com 的 SSH 认证没通。推送必须走 SSH。" >&2
   echo "    三步挂上公钥（token 带 admin:public_key 时可自动完成）：" >&2
   echo "      test -f ~/.ssh/id_ed25519_remotedesk || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519_remotedesk" >&2
