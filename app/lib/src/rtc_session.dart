@@ -373,7 +373,14 @@ class RtcSession {
   ///
   /// Returns false when there is no sender yet (offer not applied), in which
   /// case the caller keeps the new stream for the next session.
-  Future<bool> replaceLocalStream(MediaStream stream) async {
+  ///
+  /// [stopPrevious] must be false when several sessions share one capture:
+  /// the first session to swap would otherwise stop the track the others are
+  /// still sending, and they would go black mid-call.
+  Future<bool> replaceLocalStream(
+    MediaStream stream, {
+    bool stopPrevious = true,
+  }) async {
     final sender = _videoSender;
     final tracks = stream.getVideoTracks();
     if (sender == null || tracks.isEmpty) return false;
@@ -391,7 +398,7 @@ class RtcSession {
       localRenderer.srcObject = stream;
     } catch (_) {}
 
-    if (previous != null && previous != stream) {
+    if (stopPrevious && previous != null && previous != stream) {
       for (final track in previous.getTracks()) {
         try {
           await track.stop();
@@ -621,7 +628,12 @@ class RtcSession {
     return _stats;
   }
 
-  Future<void> close() async {
+  /// Tear the session down.
+  ///
+  /// [stopLocalStream] must be false when the capture is shared with other
+  /// sessions: stopping the tracks here would kill their picture too, and the
+  /// owner of the stream is the only one that knows when the last viewer left.
+  Future<void> close({bool stopLocalStream = true}) async {
     if (_disposed) return;
     _disposed = true;
     _setPhase(SessionPhase.closed);
@@ -634,7 +646,7 @@ class RtcSession {
     // Stop the capture so the OS/browser screen-sharing indicator goes away.
     final stream = _localStream;
     _localStream = null;
-    if (stream != null) {
+    if (stopLocalStream && stream != null) {
       for (final track in stream.getTracks()) {
         try {
           await track.stop();

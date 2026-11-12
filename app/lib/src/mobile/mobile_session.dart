@@ -445,6 +445,8 @@ class _MobileSessionViewState extends State<MobileSessionView>
                     : const SizedBox.shrink(),
               ),
               if (!ready) _waiting(),
+              if (ready && _viewport.isZoomed)
+                Positioned(right: 14, bottom: 14, child: _resetButton()),
               IgnorePointer(child: _ripple()),
             ],
           ),
@@ -465,15 +467,73 @@ class _MobileSessionViewState extends State<MobileSessionView>
             const CircularProgressIndicator(color: Colors.white24),
           const SizedBox(height: 14),
           Text(
-            failed ? '连接失败，回去再试一次' : '等待电脑画面…',
+            failed ? '没连上' : '等待电脑画面…',
             style: const TextStyle(color: Colors.white70),
           ),
           const SizedBox(height: 6),
-          const Text(
-            '电脑端需要点「接受并共享屏幕」',
-            style: TextStyle(color: Colors.white38, fontSize: 12),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 32),
+            child: Text(
+              failed
+                  ? '电脑那边的 RemoteDesk 可能关了，或者没人点「接受」。'
+                  : '电脑端需要点「接受并共享屏幕」',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white38, fontSize: 12, height: 1.5),
+            ),
           ),
+          // Only while the session is *not* live. Once it is live the top bar's
+          // back arrow is the established exit, and a second identical icon
+          // here would just compete with it (and confuse anything that looks
+          // for the back arrow).
+          if (widget.phase != SessionPhase.live) ...[
+            const SizedBox(height: 18),
+            OutlinedButton.icon(
+              onPressed: _confirmHangUp,
+              icon: const Icon(Icons.arrow_back, size: 16),
+              label: Text(failed ? '回到电脑列表' : '停止等待'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.white70,
+                side: const BorderSide(color: Colors.white24),
+                padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+              ),
+            ),
+          ],
         ],
+      ),
+    );
+  }
+
+  /// Always-visible way back to 100 %, drawn on top of the picture.
+  ///
+  /// The top bar already had a zoom-reset icon, but it only appeared once the
+  /// picture was magnified and it sat between four other icons — easy to miss,
+  /// and "放大之后回不去" was the report. This one is where the thumb already is.
+  Widget _resetButton() {
+    return Material(
+      color: const Color(0xFF2563EB).withValues(alpha: 0.94),
+      borderRadius: BorderRadius.circular(22),
+      elevation: 3,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(22),
+        onTap: () => setState(_viewport.reset),
+        child: const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 15, vertical: 10),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.zoom_out_map, size: 16, color: Colors.white),
+              SizedBox(width: 6),
+              Text(
+                '还原',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -653,19 +713,28 @@ class _MobileSessionViewState extends State<MobileSessionView>
   }
 
   Future<void> _confirmHangUp() async {
+    // Nothing is on screen yet while connecting, so "断开后画面就不再传过来"
+    // is nonsense there — the user is trying to *stop waiting*, not to leave a
+    // live picture. The wording has to match what the button will actually do.
+    final connecting = widget.phase != SessionPhase.live;
     final leaves = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('断开连接？'),
-        content: const Text('断开后电脑上的画面就不再传过来了。'),
+        title: Text(connecting ? '停止这次连接？' : '断开连接？'),
+        content: Text(
+          connecting
+              ? '现在还没连上。停止就回到电脑列表，可以换一台连，'
+                  '或者等电脑那边点了「接受」再试。'
+              : '断开后电脑上的画面就不再传过来了。',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('继续看'),
+            child: Text(connecting ? '继续等' : '继续看'),
           ),
           FilledButton(
             onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('断开'),
+            child: Text(connecting ? '停止' : '断开'),
           ),
         ],
       ),

@@ -26,6 +26,7 @@ import 'src/mobile/mobile_home.dart';
 import 'src/pairing_code.dart';
 import 'src/platform_kind.dart';
 import 'src/peer_info.dart';
+import 'src/reach.dart';
 import 'src/rtc_session.dart';
 import 'src/screen_capture.dart';
 import 'src/session_view.dart';
@@ -194,6 +195,13 @@ class _HomePageState extends State<HomePage> implements MobileHost {
   /// `ws://100.101.102.103:8787/ws`. Empty while not hosting.
   String _peerServerUrl = '';
 
+  /// How far this machine's relay is reachable from — the answer to "can I
+  /// connect to this computer when I am not at home?". See `reach.dart`.
+  ReachInfo _reach = ReachInfo.unknown;
+
+  /// Whether the "connect from outside" explanation is unfolded.
+  bool _reachOpen = false;
+
   StreamSubscription<Map<String, dynamic>>? _sub;
   StreamSubscription<Map<String, dynamic>>? _dialSub;
   final List<String> _logs = <String>[];
@@ -213,10 +221,33 @@ class _HomePageState extends State<HomePage> implements MobileHost {
   /// silently ignored by the far server.
   late SignalingClient _activeSignaling = _client;
 
+  /// Sessions this machine is *serving*, keyed by the caller's id.
+  ///
+  /// A desktop can legitimately be watched by more than one device at once —
+  /// a phone next to a laptop, both looking at the same screen. Keeping a
+  /// single session here used to mean the second caller silently evicted the
+  /// first, which reads as "the phone cannot connect while the Mac is
+  /// connected". Each entry owns its peer connection and input channel; only
+  /// the captured stream is shared.
+  final Map<String, RtcSession> _hosted = <String, RtcSession>{};
+
+  /// The session currently shown in the stage.
+  ///
+  /// On the controller this is the only one. On the target it is the most
+  /// recent entry of [_hosted] — the stage there only previews what is being
+  /// sent, so one representative is enough.
   RtcSession? _session;
   SessionPhase _phase = SessionPhase.idle;
   SessionStats _stats = SessionStats.empty;
   Timer? _statsTimer;
+
+  /// Fails a session that never reaches `live`.
+  ///
+  /// Without it a call the far side accepted but never negotiated left the
+  /// phone on a spinner forever with no explanation — the state machine simply
+  /// stayed in `connecting`. 25 s is past the point where a person has decided
+  /// it is not going to work.
+  Timer? _connectTimer;
 
   /// Target only: watches whether the display being captured still exists.
   /// Separate from [_statsTimer] because it is far more expensive (it asks the
@@ -238,7 +269,19 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       if (mounted) setState(() {});
     },
   );
-  StreamSubscription<proto.InputEvent>? _inputSub;
+  /// One subscription per session. Input channels belong to a peer connection,
+  /// so a single field would unsubscribe the first caller the moment a second
+  /// one arrived — with no error, just a mouse that stopped moving.
+  final Map<String, StreamSubscription<proto.InputEvent>> _inputSubs =
+      <String, StreamSubscription<proto.InputEvent>>{};
+
+  /// The one capture shared by every hosted session.
+  ///
+  /// Grabbing the screen once and attaching the same track to several peer
+  /// connections keeps CPU and encoder load flat as viewers are added.
+  /// Capturing per caller would run the OS screen grab N times for pixels that
+  /// are identical anyway.
+  MediaStream? _hostStream;
 
   /// Clipboard mirroring for the duration of a session.
   ///
@@ -374,7 +417,13 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       // this change removes — carrying it forward would keep pointing at a
       // machine that may no longer relay for anyone.
       final saved = urlServer ?? prefs.getString(_kRelayOverride);
-      if (saved != null && saved.isNotEmpty) _serverCtrl.text = saved;
+      // A loopback address is not an override — it is the default written out
+      // longhand. Restoring it made the offline banner claim "这是你手工指定的
+      // 地址" about a value nobody chose, and pointed at a port that may well be
+      // served by some unrelated program.
+      if (saved != null && saved.isNotEmpty && !_isLoopbackRelay(saved)) {
+        _serverCtrl.text = saved;
+      }
       _deviceCtrl.text = deviceId;
       if (urlPeer != null && urlPeer.isNotEmpty) _targetCtrl.text = urlPeer;
       _autoJoin = query['autojoin'] == '1';
@@ -496,24 +545,34 @@ class _HomePageState extends State<HomePage> implements MobileHost {
   }
 
   /// Bind the relay and remember what to tell the other machine.
+  ///
+  /// Also decides — from the addresses the OS reports — whether anyone outside
+  /// this network can reach it. That answer is the one piece of information the
+  /// old screen never showed, and it is the difference between "this app only
+  /// works on my home Wi-Fi" and "this app works from anywhere".
   Future<void> _startHosting({bool quietWhenTaken = false}) async {
     final ok = await _localServer.start(port: 8787);
     if (!ok) {
       // Normal: the Node server, or a second copy of this app, already serves.
       if (!quietWhenTaken) _log('端口 8787 已被占用，直接连它');
-    } else {
-      final ips = await localIpv4Addresses();
-      final picked = pickPeerAddress(ips);
-      if (!mounted) return;
-      setState(() {
-        _peerServerUrl = picked == null ? '' : 'ws://$picked:8787/ws';
-      });
+    }
+    final ips = await localIpv4Addresses();
+    final picked = pickPeerAddress(ips);
+    final reach = classifyReach(ips);
+    if (!mounted) return;
+    setState(() {
+      _reach = reach;
+      _peerServerUrl = picked == null ? '' : 'ws://$picked:8787/ws';
+    });
+    if (ok) {
       _log(picked == null
           ? '本机可被连接（端口 8787）'
           : '本机可被连接：$_peerServerUrl');
       final others = ips.where((ip) => ip != picked).toList();
       if (others.isNotEmpty) _log('本机其它可用地址: ${others.join(', ')}');
     }
+    _log('外网可达性：${reach.headline}'
+        '${reach.chosen == null ? '' : '（${reach.chosen}）'}');
     // Advertised by `/info` so a scanning peer sees a name instead of an IP.
     // Set even when the port was taken: in that case the relay is someone
     // else's, but this machine's identity is still this machine's.
@@ -523,13 +582,40 @@ class _HomePageState extends State<HomePage> implements MobileHost {
     );
   }
 
+  /// Re-read the network addresses after the user installs or signs in to
+  /// Tailscale. Nothing else can notice that: the app has no event for "a new
+  /// network interface appeared", and asking the user to restart the program
+  /// for that is a bad trade.
+  Future<void> _refreshReach() async {
+    final ips = await localIpv4Addresses();
+    if (!mounted) return;
+    final reach = classifyReach(ips);
+    final picked = pickPeerAddress(ips);
+    setState(() {
+      _reach = reach;
+      _peerServerUrl = picked == null ? '' : 'ws://$picked:8787/ws';
+    });
+    _log('重新检测网络：${reach.headline}'
+        '${reach.chosen == null ? '' : '（${reach.chosen}）'}');
+  }
+
   @override
   void dispose() {
     _statsTimer?.cancel();
-    _inputSub?.cancel();
+    _sourceWatchTimer?.cancel();
+    _connectTimer?.cancel();
+    for (final sub in _inputSubs.values) {
+      sub.cancel();
+    }
+    _inputSubs.clear();
     _sub?.cancel();
     _dialSub?.cancel();
+    for (final session in _hosted.values) {
+      session.close();
+    }
     _session?.close();
+    _hosted.clear();
+    _session = null;
     _injector.dispose();
     _client.dispose();
     _dial.dispose();
@@ -634,12 +720,22 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       case 'answer':
       case 'ice':
       case 'candidate':
-        final handled = await _session?.handleSignal(m) ?? false;
-        if (!handled) _log('收到未处理的 ${m['type']} (无会话)');
+        // Route by sender, never by "the current session". With several callers
+        // connected, each negotiation belongs to exactly one of them; handing a
+        // frame to the wrong one leaves both half-negotiated with no error on
+        // either side.
+        final peer = '${m['from'] ?? ''}';
+        final target =
+            _hosted[peer] ?? (_session?.peerId == peer ? _session : null);
+        final handled = await target?.handleSignal(m) ?? false;
+        if (!handled) {
+          _log('收到未处理的 ${m['type']}（对端 ${_prettyPeerId(peer)} 没有会话）');
+        }
         break;
       case 'peer_left':
-        _log('对端已离开 from=${m['from']}');
-        await _teardownSession();
+        final gone = '${m['from'] ?? ''}';
+        _log('对端已离开 from=${_prettyPeerId(gone)}');
+        await _closeSession(gone);
         break;
       case 'peer_offline':
         _log('设备离线: ${m['id']}');
@@ -663,6 +759,19 @@ class _HomePageState extends State<HomePage> implements MobileHost {
     }
   }
 
+  /// True when a relay address points at this machine.
+  ///
+  /// Typing `127.0.0.1` into 更多设置 is indistinguishable from leaving it
+  /// blank, so it must not be treated as a deliberate override — otherwise the
+  /// UI claims the user chose an address and offers to "clear" something they
+  /// never set.
+  static bool _isLoopbackRelay(String url) {
+    final value = url.trim().toLowerCase();
+    return value.contains('127.0.0.1') ||
+        value.contains('localhost') ||
+        value.contains('[::1]');
+  }
+
   Future<void> _connect() async {
     // Guarded: the launch path connects automatically, and the reconnect button
     // in 高级设置 goes through the same function.
@@ -675,7 +784,9 @@ class _HomePageState extends State<HomePage> implements MobileHost {
     // No address configured means "join my own relay" — that is now the normal
     // case, not a fallback. An address is only ever an override.
     final override = _serverCtrl.text.trim();
-    final url = override.isEmpty ? 'ws://127.0.0.1:8787/ws' : override;
+    final url = override.isEmpty || _isLoopbackRelay(override)
+        ? 'ws://127.0.0.1:8787/ws'
+        : override;
     _log('正在连接 $url ...');
     try {
       await _client.connect(url: url, id: id, name: 'flutter-client');
@@ -719,7 +830,15 @@ class _HomePageState extends State<HomePage> implements MobileHost {
     String peer,
     SignalingClient signaling,
   ) async {
-    await _teardownSession(notifyPeer: false);
+    // Only clear *our* controller session. A blanket teardown here also killed
+    // the sessions other devices were watching on this machine, so answering a
+    // call while someone else was connected dropped their picture.
+    final previous = _session;
+    if (previous != null && previous.role == SessionRole.controller) {
+      await _inputSubs.remove(previous.peerId)?.cancel();
+      _session = null;
+      await previous.close();
+    }
     _activeSignaling = signaling;
     final session = RtcSession(
       role: SessionRole.controller,
@@ -740,6 +859,7 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       await session.start();
       await session.createOffer();
       _startStatsTimer();
+      _armConnectTimeout(peer);
     } catch (e) {
       _log('建立主控会话失败: $e');
       setState(() => _phase = SessionPhase.failed);
@@ -748,33 +868,48 @@ class _HomePageState extends State<HomePage> implements MobileHost {
 
   Future<void> _acceptAndShare(String peer) async {
     if (_busy) return;
-    setState(() => _busy = true);
-    _log('正在请求屏幕采集…');
-
     // Read the view geometry before any await: after the capture prompt the
     // context may be gone, and this is only a fallback anyway.
     final fallbackScreen = View.of(context).physicalSize;
 
-    // Capture first: browsers only allow getDisplayMedia inside a user gesture.
-    final MediaStream stream;
-    try {
-      stream = _useFakeCapture
-          // Self-test path: same RtcSession pipeline, no permission prompt.
-          ? await navigator.mediaDevices.getUserMedia(<String, dynamic>{
-              'video': <String, dynamic>{'width': 1280, 'height': 720, 'frameRate': 30},
-              'audio': false,
-            })
-          : await _capture.capture(await _resolveCaptureRequest());
-    } catch (e) {
-      _log('屏幕采集被取消或失败: $e');
-      _activeSignaling.reject(peer);
-      if (mounted) {
-        setState(() => _busy = false);
-      }
-      return;
-    }
+    // A repeat call from the same caller (double tap, retry after a timeout)
+    // must replace its own session, not pile a second peer connection onto the
+    // same device id — the relay only has one slot per id.
+    await _closeSession(peer);
+    if (!mounted) return;
+    setState(() => _busy = true);
+    _log('正在请求屏幕采集…');
 
-    await _teardownSession(notifyPeer: false);
+    // Share one capture across every caller. Asking for the screen again for a
+    // second viewer would pop a second permission prompt on macOS and run a
+    // second screen grab for identical pixels.
+    MediaStream? stream = _hostStream;
+    if (stream == null) {
+      // Capture first: browsers only allow getDisplayMedia inside a user gesture.
+      try {
+        stream = _useFakeCapture
+            // Self-test path: same RtcSession pipeline, no permission prompt.
+            ? await navigator.mediaDevices.getUserMedia(<String, dynamic>{
+                'video': <String, dynamic>{
+                  'width': 1280,
+                  'height': 720,
+                  'frameRate': 30,
+                },
+                'audio': false,
+              })
+            : await _capture.capture(await _resolveCaptureRequest());
+      } catch (e) {
+        _log('屏幕采集被取消或失败: $e');
+        _activeSignaling.reject(peer);
+        if (mounted) {
+          setState(() => _busy = false);
+        }
+        return;
+      }
+      _hostStream = stream;
+    } else {
+      _log('复用已有画面（不再单独采集）——${_hosted.length} 人正在看这台电脑');
+    }
 
     // Accepting control is the moment to ask for whatever the injector still
     // needs — on macOS that is the Accessibility grant. Keeping the prompt here
@@ -798,8 +933,9 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       iceServers: _iceServers,
       targetScreen: injectorScreen,
       onLog: _log,
-      onPhase: _onPhase,
+      onPhase: (phase) => _onHostedPhase(peer, phase),
     );
+    _hosted[peer] = session;
     setState(() {
       _session = session;
       _phase = SessionPhase.preparing;
@@ -810,22 +946,47 @@ class _HomePageState extends State<HomePage> implements MobileHost {
 
     // Accept only once we really have frames to send.
     _activeSignaling.accept(peer);
-    _log('已接受 ${_prettyPeerId(peer)}，开始共享屏幕');
+    _log('已接受 ${_prettyPeerId(peer)}，开始共享屏幕'
+        '${_hosted.length > 1 ? '（共 ${_hosted.length} 人）' : ''}');
 
     try {
       await session.start(localStream: stream);
       _startStatsTimer();
       _startSourceWatch();
+      _armConnectTimeout(peer);
     } catch (e) {
       _log('建立被控会话失败: $e');
       setState(() => _phase = SessionPhase.failed);
     }
   }
 
+  /// Phase changes are reported per session; only the one on stage drives the
+  /// header, so a second caller failing must not blank out a working picture.
+  void _onHostedPhase(String peer, SessionPhase phase) {
+    if (!mounted) return;
+    if (_session?.peerId != peer) return;
+    setState(() => _phase = phase);
+  }
+
   void _onPhase(SessionPhase phase) {
     if (!mounted) return;
+    if (phase == SessionPhase.live) {
+      _connectTimer?.cancel();
+      _connectTimer = null;
+    }
     setState(() => _phase = phase);
     _reportTitle();
+  }
+
+  void _armConnectTimeout(String peer) {
+    _connectTimer?.cancel();
+    _connectTimer = Timer(const Duration(seconds: 25), () {
+      if (!mounted) return;
+      if (_phase == SessionPhase.live) return;
+      if (_session?.peerId != peer) return;
+      _log('${_prettyPeerId(peer)} 25 秒还没出画面 —— 通道没有建立');
+      setState(() => _phase = SessionPhase.failed);
+    });
   }
 
   /// True when ⌘ should travel as Ctrl.
@@ -846,16 +1007,23 @@ class _HomePageState extends State<HomePage> implements MobileHost {
   }
 
   void _sendClipboard(String text) {
-    final session = _session;
-    if (session == null) return;
-    if (!session.input.isOpen) {
+    // Every live session shares this machine's clipboard: with several viewers
+    // connected, copying once here has to reach all of them, not just the one
+    // currently drawn in the stage.
+    if (_hosted.isEmpty && _session == null) return;
+    final targets = <RtcSession>{..._hosted.values};
+    final current = _session;
+    if (current != null) targets.add(current);
+    var sent = 0;
+    for (final session in targets) {
       // Not queued on purpose: by the time the channel opens, the text can be
       // minutes old, and pushing stale clipboard content into someone's machine
       // is worse than not pushing it. The toolbar's push button is the retry.
-      _log('输入通道未就绪，本次剪贴板未发送');
-      return;
+      if (!session.input.isOpen) continue;
+      session.input.send(proto.ClipboardEvent(text));
+      sent++;
     }
-    session.input.send(proto.ClipboardEvent(text));
+    if (sent == 0) _log('输入通道未就绪，本次剪贴板未发送');
   }
 
   Future<void> _startClipboard() async {
@@ -870,7 +1038,7 @@ class _HomePageState extends State<HomePage> implements MobileHost {
     setState(() => _clipboardEnabled = on);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_kClipboard, on);
-    if (on && _session != null) {
+    if (on && (_session != null || _hosted.isNotEmpty)) {
       await _clipboard.start();
     } else {
       await _clipboard.stop();
@@ -894,14 +1062,22 @@ class _HomePageState extends State<HomePage> implements MobileHost {
   /// desktop. On the controller the only inbound frame is the target's
   /// `hello`, which just updates the HUD.
   void _bindSessionInput(RtcSession session) {
-    _inputSub?.cancel();
-    _remoteHello = null;
-    _inputRx = 0;
-    _moveRx = 0;
-    _keyRx = 0;
-    _inputSub = session.input.events.listen((event) async {
+    final peer = session.peerId;
+    _inputSubs.remove(peer)?.cancel();
+    if (session.role == SessionRole.controller) {
+      _remoteHello = null;
+      _inputRx = 0;
+      _moveRx = 0;
+      _keyRx = 0;
+    }
+    _inputSubs[peer] = session.input.events.listen((event) async {
       if (event is proto.HelloEvent) {
         if (!mounted) return;
+        // Only the controller renders `hello` (the HUD shows the far desktop's
+        // real size). On the target it means the far end is configured as a
+        // controller too — nothing to draw, and overwriting our own stage's
+        // geometry from it would be wrong.
+        if (session.role != SessionRole.controller) return;
         setState(() => _remoteHello = event);
         _log('远端桌面 ${event.screenWidth}×${event.screenHeight}'
             '（画面 ${event.videoWidth}×${event.videoHeight}）'
@@ -970,9 +1146,9 @@ class _HomePageState extends State<HomePage> implements MobileHost {
     _sourceWatchTimer?.cancel();
     _sourceWatchTimer =
         Timer.periodic(const Duration(seconds: 5), (timer) async {
-      final session = _session;
-      if (session == null || !mounted) return;
-      if (session.role != SessionRole.target) return;
+      // Watch while *any* caller is being served; the capture is shared, so one
+      // broken display breaks every viewer at once.
+      if (_hosted.isEmpty || !mounted) return;
       if (_recovering) return;
       final current = _request.sourceId;
       if (current == null) return;
@@ -982,7 +1158,7 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       if (next == null) return;
       _recovering = true;
       try {
-        await _recoverCapture(session, next);
+        await _recoverCapture(next);
       } finally {
         _recovering = false;
       }
@@ -990,7 +1166,10 @@ class _HomePageState extends State<HomePage> implements MobileHost {
   }
 
   /// 把采集切到 [next]，全程不动会话。
-  Future<void> _recoverCapture(RtcSession session, CaptureSource next) async {
+  ///
+  /// 多个被控会话共享同一条采集流，所以这里必须先把新轨道换到**每一个**会话
+  /// 上，最后才能停旧流。先停旧流会让还没换的那几路当场黑屏。
+  Future<void> _recoverCapture(CaptureSource next) async {
     final request = _request.copyWith(sourceId: next.id);
     _log('⚠ 原采集源已从系统消失（显示器断电或换线？），'
         '改用 ${next.name} [${next.id}] 并重采');
@@ -1004,32 +1183,139 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       return;
     }
     _request = request;
-    if (await session.replaceLocalStream(stream)) {
-      _log('画面已恢复（采集源 ${next.name}）');
-      return;
+    final previous = _hostStream;
+    _hostStream = stream;
+
+    var swapped = 0;
+    for (final session in _hosted.values.toList(growable: false)) {
+      if (await session.replaceLocalStream(stream, stopPrevious: false)) {
+        swapped++;
+      } else {
+        // 还没走到 addTrack（offer 未到），把新流直接交给会话，下次挂轨就用它。
+        await session.useLocalStream(stream);
+      }
     }
-    // 还没走到 addTrack（offer 未到），把新流直接交给会话，下次挂轨就用它。
-    await session.useLocalStream(stream);
-    _log('采集已重建，等会话挂轨后生效');
+
+    // 所有会话都换到新轨道之后才能停旧流。
+    if (previous != null && !identical(previous, stream)) {
+      for (final track in previous.getTracks()) {
+        try {
+          await track.stop();
+        } catch (_) {}
+      }
+    }
+    _log(swapped > 0
+        ? '画面已恢复（采集源 ${next.name}）· $swapped 路会话已切换'
+        : '采集已重建，等会话挂轨后生效');
   }
 
+  /// 关掉**某一路**会话（被控端按对端 id；主控端就是唯一那一路）。
+  ///
+  /// 清理无条件执行，包括 `_busy`、拨号连接和 `setState`。原来的写法在
+  /// `_session == null`（还在拨号、等对方接受）时直接 return，于是"连不上想
+  /// 取消"留下的是一个永远转圈的按钮、一条仍然挂着的拨号连接，而且界面不刷新
+  /// ——用户只能杀掉进程重来。
+  Future<void> _closeSession(String peerId, {bool notifyPeer = true}) async {
+    _connectTimer?.cancel();
+    _connectTimer = null;
+    final hosted = _hosted.remove(peerId);
+    final current = _session;
+
+    if (hosted != null) {
+      if (notifyPeer) hosted.signaling.leave(peerId);
+      await _inputSubs.remove(peerId)?.cancel();
+      await hosted.close(stopLocalStream: false);
+    }
+    if (current != null && current.peerId == peerId && !identical(current, hosted)) {
+      if (notifyPeer) current.signaling.leave(peerId);
+      await _inputSubs.remove(peerId)?.cancel();
+      await current.close(stopLocalStream: _hosted.isEmpty);
+      _session = null;
+    } else if (identical(current, hosted)) {
+      _session = null;
+    }
+
+    // 还有别的被控会话：舞台切到剩下那一路，别让界面突然空白。
+    if (_session == null && _hosted.isNotEmpty) {
+      _session = _hosted.values.last;
+      _phase = _session!.phase;
+    }
+    if (_session == null) {
+      _phase = SessionPhase.idle;
+      _stats = SessionStats.empty;
+      _remoteHello = null;
+      _statsTimer?.cancel();
+      _statsTimer = null;
+    }
+
+    // 一个会话都不剩才停采集：共享流一停，系统那个"正在共享屏幕"的提示才消失。
+    if (_hosted.isEmpty && _session == null) {
+      _sourceWatchTimer?.cancel();
+      _sourceWatchTimer = null;
+      await _clipboard.stop();
+      await _stopHostStream();
+    } else if (_hosted.isNotEmpty) {
+      // 还有人在看，采集看门狗必须继续跑。
+      _startSourceWatch();
+    }
+
+    // 拨号连接只属于这一次呼叫；留着会在对端留下一条过期登记。
+    if (_activeSignaling == _dial && _hosted.isEmpty && _session == null) {
+      await _dial.disconnect();
+      _activeSignaling = _client;
+    }
+    _busy = false;
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _stopHostStream() async {
+    final stream = _hostStream;
+    _hostStream = null;
+    if (stream == null) return;
+    for (final track in stream.getTracks()) {
+      try {
+        await track.stop();
+      } catch (_) {}
+    }
+  }
+
+  /// 清空全部会话与计时器（退出程序、断开信令时用）。
   Future<void> _teardownSession({bool notifyPeer = true}) async {
     _statsTimer?.cancel();
     _statsTimer = null;
+    _connectTimer?.cancel();
+    _connectTimer = null;
     _sourceWatchTimer?.cancel();
     _sourceWatchTimer = null;
     _recovering = false;
-    _inputSub?.cancel();
-    _inputSub = null;
+    for (final sub in _inputSubs.values.toList(growable: false)) {
+      await sub.cancel();
+    }
+    _inputSubs.clear();
     await _clipboard.stop();
     _remoteHello = null;
-    final session = _session;
-    if (session == null) return;
-    if (notifyPeer) _activeSignaling.leave(session.peerId);
+
+    final peers = <String>{
+      ..._hosted.keys,
+      if (_session != null) _session!.peerId,
+    };
+    for (final peer in peers) {
+      final hosted = _hosted.remove(peer);
+      if (hosted != null) {
+        if (notifyPeer) hosted.signaling.leave(peer);
+        await hosted.close(stopLocalStream: false);
+      }
+      final current = _session;
+      if (current != null && current.peerId == peer && !identical(current, hosted)) {
+        if (notifyPeer) current.signaling.leave(peer);
+        await current.close(stopLocalStream: false);
+      }
+    }
     _session = null;
+    await _stopHostStream();
     _stats = SessionStats.empty;
     _phase = SessionPhase.idle;
-    await session.close();
+    _busy = false;
     // The dial connection exists only for this session; keeping it open would
     // leave a stale registration on a machine that may reboot or move.
     if (_activeSignaling == _dial) {
@@ -1039,10 +1325,21 @@ class _HomePageState extends State<HomePage> implements MobileHost {
     if (mounted) setState(() {});
   }
 
+  /// 「断开」按钮：结束当前会话，或取消一次还没被接受的呼叫。
   Future<void> _hangUp() async {
     final peer = _session?.peerId ?? _targetCtrl.text.trim();
-    if (peer.isNotEmpty) _activeSignaling.leave(peer);
-    await _teardownSession(notifyPeer: false);
+    if (peer.isEmpty || _session == null) {
+      // 拨号已经发出、对方还没接受：没有会话可关，但按钮必须立刻活过来。
+      _busy = false;
+      if (_activeSignaling == _dial) {
+        await _dial.disconnect();
+        _activeSignaling = _client;
+      }
+      if (mounted) setState(() {});
+      _log('已取消这次连接');
+      return;
+    }
+    await _closeSession(peer);
     _log('已结束会话');
   }
 
@@ -1083,7 +1380,7 @@ class _HomePageState extends State<HomePage> implements MobileHost {
     // otherwise leave the button disabled forever with no explanation. Fifteen
     // seconds is past the point where a person has decided it is stuck.
     Timer(const Duration(seconds: 15), () {
-      if (!mounted || !_busy || _session != null) return;
+      if (!mounted || !_busy || _session?.role == SessionRole.controller) return;
       setState(() => _busy = false);
       _log('${_prettyPeerId(to)} 15 秒没有回应 —— 可能窗口弹在对方看不到的地方；'
           '对端开着「允许远程控制」时会自动接受，没开就需要有人在那边点一下');
@@ -1107,7 +1404,7 @@ class _HomePageState extends State<HomePage> implements MobileHost {
 
   /// Dial a peer picked from the list (or a remembered one).
   Future<void> _dialTo(PeerInfo peer, {String? password}) async {
-    if (_busy || _session != null) return;
+    if (_busy || _session?.role == SessionRole.controller) return;
     setState(() {
       _targetCtrl.text = peer.id;
       _targetHost = peer.host;
@@ -1455,7 +1752,7 @@ class _HomePageState extends State<HomePage> implements MobileHost {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('RemoteDesk · M2 远程控制'),
+        title: const Text('RemoteDesk'),
         backgroundColor: Theme.of(context).colorScheme.primaryContainer,
         actions: [
           // Busy spinner doubles as feedback while capture permission is pending.
@@ -1534,10 +1831,10 @@ class _HomePageState extends State<HomePage> implements MobileHost {
               Icon(Icons.screen_share_outlined,
                   size: 48, color: Theme.of(context).colorScheme.outline),
               const SizedBox(height: 12),
-              const Text('还没有进行中的会话'),
+              const Text('还没连上任何电脑'),
               const SizedBox(height: 6),
               Text(
-                '呼叫对端，或等待别人呼叫你',
+                '左边点一台连过去；或者等别人连你',
                 style: TextStyle(color: Theme.of(context).colorScheme.outline),
               ),
             ],
@@ -1607,16 +1904,264 @@ class _HomePageState extends State<HomePage> implements MobileHost {
           const SizedBox(width: 10),
           Expanded(
             child: Text(
-              _serverCtrl.text.trim().isEmpty
-                  ? '本机的中转服务没起来（端口 8787）。\n'
-                      '通常是有另一份程序或旧的 node 服务占着这个端口。'
-                      '不影响被连接，但对方可能找不到你。'
+              _serverCtrl.text.trim().isEmpty ||
+                      _isLoopbackRelay(_serverCtrl.text)
+                  ? '本机的服务端口 8787 没起来，可能被别的程序占着。\n'
+                      '别人仍然可以连你（局域网/配对码），但你现在连不出别人。'
                   : '连不上 ${_serverCtrl.text.trim()}。\n'
-                      '这是你在「高级」里手工指定的地址 —— 清空它就会改回本机。',
+                      '这是「更多设置」里手工填的地址 —— 清空它就会改回本机。',
               style: theme.textTheme.bodySmall?.copyWith(
                 color: theme.colorScheme.onErrorContainer,
                 height: 1.5,
               ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Who is watching this machine right now, and how to drop one of them.
+  ///
+  /// A desktop can serve several viewers at once, so "somebody is connected"
+  /// is no longer a yes/no fact: the user needs to see how many, and to be able
+  /// to kick one without closing the others.
+  Widget _viewersRow(ThemeData theme) {
+    if (_hosted.isEmpty) return const SizedBox.shrink();
+    final ids = _hosted.keys.toList(growable: false);
+    const green = Color(0xFF16A34A);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(10, 9, 6, 9),
+      decoration: BoxDecoration(
+        color: green.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: green.withValues(alpha: 0.28)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.visibility_outlined, size: 15, color: green),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  '${ids.length} 台设备正在看这台电脑',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: green,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          for (final id in ids)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Row(
+                children: [
+                  const SizedBox(width: 21),
+                  Expanded(
+                    child: Text(
+                      _prettyPeerId(id),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        fontFamily: 'monospace',
+                        color: theme.colorScheme.onSurface,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () => _closeSession(id),
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      minimumSize: const Size(0, 28),
+                    ),
+                    child: const Text('断开', style: TextStyle(fontSize: 12)),
+                  ),
+                ],
+              ),
+            ),
+          if (ids.length > 1)
+            Padding(
+              padding: const EdgeInsets.only(top: 4, right: 4),
+              child: Text(
+                '多人同时操作时鼠标会互相抢。要稳定操作，只留一个人就好。',
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: theme.colorScheme.outline,
+                  height: 1.4,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// One line that answers "can my phone reach this computer from outside?",
+  /// with the explanation folded underneath.
+  ///
+  /// Before this existed the answer was only inferable from an IP address in an
+  /// advanced field, so "connect over the internet" read as a feature that did
+  /// not exist. The status is stated first, the steps only appear when asked.
+  Widget _reachRow(ThemeData theme) {
+    final reach = _reach;
+    final ok = reach.worksFromOutside;
+    final color = switch (reach.kind) {
+      ReachKind.tailscale => const Color(0xFF16A34A),
+      ReachKind.lanOnly => const Color(0xFFD97706),
+      ReachKind.publicIp => const Color(0xFF2563EB),
+      ReachKind.none => theme.colorScheme.outline,
+    };
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: () => setState(() => _reachOpen = !_reachOpen),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: color.withValues(alpha: 0.28)),
+            ),
+            child: Row(
+              children: [
+                Icon(ok ? Icons.public : Icons.wifi, size: 16, color: color),
+                const SizedBox(width: 7),
+                Expanded(
+                  child: Text(
+                    reach.headline,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: color,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                Text(
+                  _reachOpen ? '收起' : '怎么连',
+                  style: theme.textTheme.labelSmall?.copyWith(color: color),
+                ),
+                Icon(
+                  _reachOpen ? Icons.expand_less : Icons.expand_more,
+                  size: 17,
+                  color: color,
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (_reachOpen) ...[
+          const SizedBox(height: 8),
+          _reachPanel(theme, reach),
+        ],
+      ],
+    );
+  }
+
+  Widget _reachPanel(ThemeData theme, ReachInfo reach) {
+    final body = theme.textTheme.bodySmall?.copyWith(
+          color: theme.colorScheme.onSurfaceVariant,
+          height: 1.55,
+        );
+    final strong = theme.textTheme.bodySmall?.copyWith(
+          color: theme.colorScheme.onSurface,
+          fontWeight: FontWeight.w600,
+        );
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(11, 10, 11, 11),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.6),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(reach.detail, style: body),
+          const SizedBox(height: 10),
+          if (reach.kind == ReachKind.lanOnly ||
+              reach.kind == ReachKind.publicIp) ...[
+            Text('要让外面也能连，按这三步：', style: strong),
+            const SizedBox(height: 6),
+            _step(theme, '1', '这台电脑装 Tailscale 并登录（tailscale.com，免费）'),
+            _step(theme, '2', '手机装 Tailscale，登录同一个账号'),
+            _step(theme, '3', '回来点下面的「重新检测」，状态会变成「出门也能连」'),
+            const SizedBox(height: 10),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: OutlinedButton.icon(
+                onPressed: _refreshReach,
+                icon: const Icon(Icons.refresh, size: 16),
+                label: const Text('重新检测'),
+                style: OutlinedButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            ),
+          ] else if (reach.kind == ReachKind.tailscale) ...[
+            Text('手机在外面这样连：', style: strong),
+            const SizedBox(height: 6),
+            _step(theme, '1', '手机装 Tailscale，登录同一个账号'),
+            _step(theme, '2', '在电脑上复制上面的配对码，发到手机'),
+            _step(theme, '3', '手机 RemoteDesk 里粘贴，点「连接」'),
+            const SizedBox(height: 8),
+            Text(
+              '不用配路由器、不用固定 IP、不用买服务器。',
+              style: theme.textTheme.labelSmall
+                  ?.copyWith(color: theme.colorScheme.primary),
+            ),
+          ] else ...[
+            Align(
+              alignment: Alignment.centerLeft,
+              child: OutlinedButton.icon(
+                onPressed: _refreshReach,
+                icon: const Icon(Icons.refresh, size: 16),
+                label: const Text('重新检测'),
+                style: OutlinedButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _step(ThemeData theme, String number, String text) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 5),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 16,
+            height: 16,
+            margin: const EdgeInsets.only(top: 1, right: 7),
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: theme.colorScheme.primary.withValues(alpha: 0.14),
+              shape: BoxShape.circle,
+            ),
+            child: Text(
+              number,
+              style: TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.w700,
+                color: theme.colorScheme.primary,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              text,
+              style: theme.textTheme.bodySmall?.copyWith(height: 1.45),
             ),
           ),
         ],
@@ -1654,6 +2199,13 @@ class _HomePageState extends State<HomePage> implements MobileHost {
                 _onlineChip(theme),
               ],
             ),
+            const SizedBox(height: 10),
+            _viewersRow(theme),
+            if (_hosted.isNotEmpty) const SizedBox(height: 8),
+            // First thing under the title: whether this machine is reachable
+            // from outside. It decides what the user should do next, so it
+            // cannot live at the bottom of an advanced panel.
+            _reachRow(theme),
             const SizedBox(height: 10),
             Row(
               crossAxisAlignment: CrossAxisAlignment.center,
@@ -1726,7 +2278,7 @@ class _HomePageState extends State<HomePage> implements MobileHost {
               ),
               const SizedBox(height: 4),
               Text(
-                '上面这行字包含名字、密码和地址，对方粘一下就能连。点一下即复制。',
+                '点一下复制，发给对方就能连。',
                 style: theme.textTheme.bodySmall
                     ?.copyWith(color: theme.colorScheme.outline, height: 1.4),
               ),
@@ -1790,8 +2342,7 @@ class _HomePageState extends State<HomePage> implements MobileHost {
             ] else ...[
               const SizedBox(height: 6),
               Text(
-                '想让这台电脑无人值守，把上面的开关打开，'
-                '再把「本机 ID」和「连接密码」发给对方。',
+                '打开后不用有人守着，凭密码自动接受。',
                 style: theme.textTheme.bodySmall
                     ?.copyWith(color: theme.colorScheme.outline, height: 1.45),
               ),
@@ -1809,7 +2360,11 @@ class _HomePageState extends State<HomePage> implements MobileHost {
   /// the handshake is an implementation detail; asking the user to decide it
   /// was the reason this screen used to need a paragraph of explanation.
   Widget _connectCard(ThemeData theme) {
-    final busy = _busy || _session != null;
+    // Only a *controller* session blocks dialling out. A session we are serving
+    // must not: one machine can be watched by a phone while its owner remote
+    // controls another computer, and greying out the whole list made that
+    // impossible to even attempt.
+    final busy = _busy || _session?.role == SessionRole.controller;
     return Card(
       margin: EdgeInsets.zero,
       child: Padding(
@@ -2030,23 +2585,32 @@ class _HomePageState extends State<HomePage> implements MobileHost {
         childrenPadding: const EdgeInsets.only(bottom: 4),
         expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
         title: Text(
-          '手动指定（找不到的时候用）',
+          '手动连（配对码不好用时）',
           style: theme.textTheme.bodySmall
               ?.copyWith(color: theme.colorScheme.outline),
         ),
         children: [
+          Text(
+            '对方把名字、密码、地址分开告诉你时才用这里；'
+            '有一行配对码就直接粘到上面的框。',
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: theme.colorScheme.outline,
+              height: 1.4,
+            ),
+          ),
+          const SizedBox(height: 8),
           Row(
             children: [
               Expanded(child: _field(_targetCtrl, '对方的名字')),
               const SizedBox(width: 8),
-              Expanded(child: _field(_passCtrl, '密码', obscure: true)),
+              Expanded(child: _field(_passCtrl, '对方的密码', obscure: true)),
             ],
           ),
           const SizedBox(height: 8),
           Row(
             children: [
               Expanded(
-                child: _field(_manualHostCtrl, '对方地址（IP 或 ws://IP:8787/ws）'),
+                child: _field(_manualHostCtrl, '对方的地址（IP 或 ws://IP:8787/ws）'),
               ),
               const SizedBox(width: 8),
               SizedBox(
@@ -2102,16 +2666,16 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       child: Theme(
         data: theme.copyWith(dividerColor: Colors.transparent),
         child: ExpansionTile(
-          // Re-keyed on the link state so the section opens by itself while
-          // offline (that is where the address lives) and folds away once the
-          // connection is up.
-          key: ValueKey<String>('advanced-$_connected'),
-          initiallyExpanded: !_connected,
+          // Always folded. Frame rate, capture source, relay override and the
+          // log path are tuning knobs, not decisions anyone makes on first run;
+          // auto-opening them while offline is what made this panel read as a
+          // control room rather than a remote-desktop app.
+          initiallyExpanded: false,
           tilePadding: const EdgeInsets.symmetric(horizontal: 14),
           childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
-          title: Text('高级设置', style: theme.textTheme.titleSmall),
+          title: Text('更多设置', style: theme.textTheme.titleSmall),
           subtitle: Text(
-            '高级 · 一般不用动',
+            '画面清晰度、中转地址、日志 · 一般不用动',
             style: theme.textTheme.bodySmall
                 ?.copyWith(color: theme.colorScheme.outline),
           ),

@@ -111,7 +111,11 @@ class _MobileHomePageState extends State<MobileHomePage> {
             Text(
               host.scanning && host.peers.isEmpty
                   ? '正在找…'
-                  : '同一 Wi-Fi 或同一个 Tailscale 网络里的电脑会自动出现在下面。',
+                  // The phone has no tailnet CLI, so it genuinely cannot list
+                  // machines on a tailnet — promising "同一个 Tailscale 网络里
+                  // 会自动出现" was simply wrong and made people wait for a row
+                  // that could never appear.
+                  : '同一 Wi-Fi 下的电脑会自动出现在下面。人在外面就用配对码。',
               style: theme.textTheme.bodySmall
                   ?.copyWith(color: theme.colorScheme.outline, height: 1.4),
             ),
@@ -162,11 +166,55 @@ class _MobileHomePageState extends State<MobileHomePage> {
           const SizedBox(height: 6),
           Text(
             '先在电脑上打开 RemoteDesk（Mac / Windows 版），\n'
-            '让它停在主界面，手机这边就会自动出现；\n'
-            '找不到就用下面的配对码。',
+            '让它停在主界面，手机这边就会自动出现。',
             textAlign: TextAlign.center,
             style: theme.textTheme.bodySmall
                 ?.copyWith(color: theme.colorScheme.outline, height: 1.5),
+          ),
+          const SizedBox(height: 14),
+          // The phone cannot discover machines on a tailnet by itself, so the
+          // "I am not at home" case needs its own explanation — otherwise the
+          // empty list reads as "the app is broken" rather than "you are on the
+          // wrong network".
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 11),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.primary.withValues(alpha: 0.07),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(
+                color: theme.colorScheme.primary.withValues(alpha: 0.22),
+              ),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(Icons.public,
+                        size: 15, color: theme.colorScheme.primary),
+                    const SizedBox(width: 6),
+                    Text(
+                      '人在外面（用手机流量）',
+                      style: theme.textTheme.labelMedium?.copyWith(
+                        color: theme.colorScheme.primary,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 7),
+                Text(
+                  '1. 手机装 Tailscale，登录和电脑同一个账号\n'
+                  '2. 让电脑上那行「配对码」发到你手机上（微信也行）\n'
+                  '3. 粘到下面「用配对码连」的框里，点连接',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    height: 1.6,
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),
