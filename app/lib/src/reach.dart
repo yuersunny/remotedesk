@@ -119,6 +119,24 @@ ReachInfo classifyReach(List<String> addresses) {
   );
 }
 
+/// What a single address in a pasted pairing code means to a phone that is
+/// NOT on the same Wi-Fi as the computer.
+///
+/// `classifyReach` answers "can others reach *this* machine"; a dialling phone
+/// needs the opposite question answered: "can I even route to this host from
+/// here". A `100.x` tailnet address is the common trap — it looks like a normal
+/// IP, but outside a connected Tailscale client it is unroutable, so a phone on
+/// 4G/5G will sit in a connection attempt with no clue what went wrong.
+enum AddressKind { tailnet, lan, publicIp, other }
+
+AddressKind classifyAddress(String host) {
+  final value = host.trim();
+  if (_octets(value) == null) return AddressKind.other;
+  if (_isTailscale(value)) return AddressKind.tailnet;
+  if (!_isPublic(value)) return AddressKind.lan;
+  return AddressKind.publicIp;
+}
+
 /// `100.64.0.0/10`, the range Tailscale (and some carriers) hand out.
 bool _isTailscale(String address) {
   final parts = _octets(address);

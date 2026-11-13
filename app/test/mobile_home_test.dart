@@ -43,7 +43,8 @@ class _FakeHost implements MobileHost {
   @override
   bool get signalingUp => true;
   @override
-  bool get busy => false;
+  bool busy = false;
+  int hangUps = 0;
   @override
   String get selfId => 'pixel-8';
   @override
@@ -60,7 +61,7 @@ class _FakeHost implements MobileHost {
   @override
   Future<void> connectManual(String target) async => manual = target;
   @override
-  Future<void> hangUp() async {}
+  Future<void> hangUp() async => hangUps++;
   @override
   void setControlEnabled(bool on) => controlEnabled = on;
 }
@@ -163,5 +164,94 @@ void main() {
     await tester.tap(find.text('office-pc'));
     await tester.pumpAndSettle();
     expect(host.connected?.id, 'office-pc');
+  });
+
+  // Regression: the "outside the house" three-step guide was rendered only by
+  // the empty-state card. As soon as the phone had ever seen a computer, the
+  // remembered rows made the list non-empty and the guide vanished — which is
+  // exactly the state shown in the 5G screenshot that could not connect.
+  testWidgets('a 100.x code explains Tailscale even with remembered rows',
+      (tester) async {
+    _usePhoneViewport(tester);
+    final host = _FakeHost(peers: <PeerInfo>[
+      const PeerInfo(
+        id: 'win',
+        host: '100.108.183.61',
+        name: 'win',
+        source: PeerSource.remembered,
+        online: false,
+      ),
+    ]);
+    await tester.pumpWidget(_app(host));
+    await tester.pumpAndSettle();
+
+    expect(find.text('还没找到电脑'), findsNothing);
+    await tester.enterText(
+      find.byType(TextField).first,
+      'RDSK1 100.108.183.61:8787 win yuersunny',
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('Tailscale 地址'), findsOneWidget);
+    expect(find.textContaining('/health'), findsOneWidget);
+    expect(find.textContaining('开关打开'), findsOneWidget);
+  });
+
+  testWidgets('a code pasted across two lines still gets the notice',
+      (tester) async {
+    _usePhoneViewport(tester);
+    await tester.pumpWidget(_app(_FakeHost()));
+    await tester.pumpAndSettle();
+
+    // Exactly what WeChat does to a copied line on a narrow phone screen.
+    await tester.enterText(
+      find.byType(TextField).first,
+      'RDSK1 100.108.183.61:8787\nwin yuersunny',
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('Tailscale 地址'), findsOneWidget);
+  });
+
+  testWidgets('a LAN code is flagged as unusable from outside', (tester) async {
+    _usePhoneViewport(tester);
+    await tester.pumpWidget(_app(_FakeHost()));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+      find.byType(TextField).first,
+      'RDSK1 192.168.1.20:8787 mac-mini 728491',
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('内网地址，外面用不了'), findsOneWidget);
+  });
+
+  testWidgets('an empty code field shows no address notice', (tester) async {
+    _usePhoneViewport(tester);
+    await tester.pumpWidget(_app(_FakeHost()));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('Tailscale 地址'), findsNothing);
+    expect(find.textContaining('这行是公网地址'), findsNothing);
+  });
+
+  // A dial with no session never opens MobileSessionView, so its "stop waiting"
+  // button is unreachable. The home screen must offer a way out while busy.
+  testWidgets('busy dial offers a stop button on the home screen',
+      (tester) async {
+    _usePhoneViewport(tester);
+    final host = _FakeHost()..busy = true;
+    await tester.pumpWidget(_app(host));
+    await tester.pumpAndSettle();
+
+    expect(find.text('正在连接…'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, '连接'), findsNothing);
+
+    final stop = find.text('停止这次连接，去连另一台');
+    await tester.ensureVisible(stop);
+    await tester.tap(stop);
+    await tester.pumpAndSettle();
+    expect(host.hangUps, 1);
   });
 }

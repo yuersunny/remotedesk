@@ -974,7 +974,13 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       _connectTimer?.cancel();
       _connectTimer = null;
     }
-    setState(() => _phase = phase);
+    // `failed` used to only change the phase. Once the session screen went
+    // away, `_busy` was still true and the connect button on the home screen
+    // stayed grey forever — no retry, no switching machines.
+    setState(() {
+      _phase = phase;
+      if (phase == SessionPhase.failed) _busy = false;
+    });
     _reportTitle();
   }
 
@@ -985,7 +991,16 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       if (_phase == SessionPhase.live) return;
       if (_session?.peerId != peer) return;
       _log('${_prettyPeerId(peer)} 25 秒还没出画面 —— 通道没有建立');
-      setState(() => _phase = SessionPhase.failed);
+      setState(() {
+        _phase = SessionPhase.failed;
+        _busy = false;
+      });
+      // Drop the half-open dial as well: otherwise the next call reuses a
+      // registration that the relay already considers stale.
+      if (_activeSignaling == _dial && _hosted.isEmpty) {
+        _dial.disconnect();
+        _activeSignaling = _client;
+      }
     });
   }
 
@@ -1368,6 +1383,22 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       );
     } catch (e) {
       _log('连不上 $host —— $e');
+      // Say what to actually do. The bare exception ("8 秒内没有握手") reads
+      // as a server fault, when the usual cause outdoors is that the phone is
+      // not on the tailnet at all and 100.x is simply unroutable.
+      switch (classifyAddress(host)) {
+        case AddressKind.tailnet:
+          _log('这是 Tailscale 的 100.x 地址：手机要装 Tailscale、登录同一账号'
+              '并把开关打开；电脑防火墙也要放行 8787。'
+              '可先用手机浏览器打开 http://$host:$_targetPort/health 验证通路');
+        case AddressKind.lan:
+          _log('这是内网地址：人在外面用不了，除非连回同一个 Wi-Fi，'
+              '或让对方装 Tailscale 后重新复制配对码');
+        case AddressKind.publicIp:
+          _log('这是公网地址：要对方路由器把 8787 转发进来、防火墙放行');
+        case AddressKind.other:
+          break;
+      }
       if (mounted) setState(() => _busy = false);
       return;
     }
