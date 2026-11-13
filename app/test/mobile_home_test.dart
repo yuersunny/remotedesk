@@ -176,7 +176,7 @@ void main() {
     final host = _FakeHost(peers: <PeerInfo>[
       const PeerInfo(
         id: 'win',
-        host: '100.108.183.61',
+        host: '100.90.1.2',
         name: 'win',
         source: PeerSource.remembered,
         online: false,
@@ -188,7 +188,7 @@ void main() {
     expect(find.text('还没找到电脑'), findsNothing);
     await tester.enterText(
       find.byType(TextField).first,
-      'RDSK1 100.108.183.61:8787 win yuersunny',
+      'RDSK1 100.90.1.2:8787 demo-pc secret123',
     );
     await tester.pumpAndSettle();
 
@@ -206,7 +206,7 @@ void main() {
     // Exactly what WeChat does to a copied line on a narrow phone screen.
     await tester.enterText(
       find.byType(TextField).first,
-      'RDSK1 100.108.183.61:8787\nwin yuersunny',
+      'RDSK1 100.90.1.2:8787\ndemo-pc secret123',
     );
     await tester.pumpAndSettle();
 

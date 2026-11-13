@@ -85,7 +85,7 @@ void main() {
 
   group('a single pasted address (phone, dialling out)', () {
     test('100.64–127 is a tailnet address', () {
-      expect(classifyAddress('100.108.183.61'), AddressKind.tailnet);
+      expect(classifyAddress('100.90.1.2'), AddressKind.tailnet);
       expect(classifyAddress('100.64.0.1'), AddressKind.tailnet);
       expect(classifyAddress('100.127.255.254'), AddressKind.tailnet);
     });
@@ -96,7 +96,7 @@ void main() {
     });
 
     test('RFC1918 and loopback are LAN', () {
-      expect(classifyAddress('192.168.1.123'), AddressKind.lan);
+      expect(classifyAddress('192.168.1.20'), AddressKind.lan);
       expect(classifyAddress('10.0.0.8'), AddressKind.lan);
       expect(classifyAddress('172.16.4.2'), AddressKind.lan);
       expect(classifyAddress('127.0.0.1'), AddressKind.lan);
@@ -107,7 +107,7 @@ void main() {
       expect(classifyAddress(''), AddressKind.other);
       expect(classifyAddress('999.1.1.1'), AddressKind.other);
       // PairingCode strips the port before this is called, but tolerate one.
-      expect(classifyAddress('100.108.183.61:8787'), AddressKind.other);
+      expect(classifyAddress('100.90.1.2:8787'), AddressKind.other);
     });
   });
 }

@@ -43,6 +43,9 @@ def inline(text: str) -> str:
     out = html.escape(text, quote=False)
     out = re.sub(r"`([^`]+)`", r"<code>\1</code>", out)
     out = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", out)
+    # Markdown 链接。说明书里挂了配套文档的相对链接，不解析的话 PDF 上会
+    # 原样印出 [《…》](xxx.md) 这种括号，看起来像没排完版。
+    out = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', out)
     return out
 
 
@@ -213,7 +216,7 @@ COVER = f"""
   </div>
 
   <h1>使用说明书</h1>
-  <p class="lede">从装好到连上，再到出事怎么查。<br>不需要账号，不需要服务器，不需要懂网络。</p>
+  <p class="lede">从装好到连上，再到出事怎么查。<br>局域网零配置，跨网用 Tailscale，不需要服务器。</p>
 
   <svg class="cover-art" viewBox="0 0 520 150" fill="none" xmlns="http://www.w3.org/2000/svg">
     <g>

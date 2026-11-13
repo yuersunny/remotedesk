@@ -26,6 +26,10 @@
 也可以跑 `python3 scripts/build-manual.py` 自己生成。手势、快捷键、速查表见
 [`GETTING-STARTED.md`](GETTING-STARTED.md)。
 
+手机**人在外面用流量**连电脑时，先看 [`docs/手机端Tailscale设置.md`](docs/手机端Tailscale设置.md)：
+没有 Google Play 从哪下官方 APK、首次启动的 VPN 授权弹窗、怎么确认开关已打开，
+以及 `/health` 验通路。排好版的 PDF 也在 Releases 里，可直接打印或发微信。
+
 ### Windows 为什么没有 exe
 
 本项目在 macOS 上开发，**Flutter 不能交叉编译到 Windows**（需要在 Windows 上跑 MSVC）。

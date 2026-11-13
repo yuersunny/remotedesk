@@ -38,9 +38,21 @@ for doc in README.md LICENSE GETTING-STARTED.md DEVELOPING.md CHANGELOG.md; do
 done
 
 # 手册：Markdown 原文进包，PDF 若已生成也一并带上——收包的人更可能直接看 PDF。
-if [ -f "$ROOT/docs/使用说明书.md" ]; then
-  mkdir -p "$OUT/docs"
-  cp "$ROOT/docs/使用说明书.md" "$OUT/docs/"
+mkdir -p "$OUT/docs"
+for doc in 使用说明书.md 手机端Tailscale设置.md; do
+  # 用 if 而不是 `[ -f ] && cp`：set -e 下，最后一项缺失时短路返回 1 会直接终止脚本。
+  if [ -f "$ROOT/docs/$doc" ]; then
+    cp "$ROOT/docs/$doc" "$OUT/docs/"
+  else
+    echo "  [x] 缺文档：docs/$doc" >&2
+    exit 1
+  fi
+done
+GUIDE_PDF="$ROOT/dist/手机端Tailscale设置.pdf"
+if [ -f "$GUIDE_PDF" ]; then
+  cp "$GUIDE_PDF" "$OUT/docs/"
+else
+  echo "  [!] 没有 $GUIDE_PDF，先跑 scripts/build-tailscale-guide.py" >&2
 fi
 MANUAL_PDF="$ROOT/dist/RemoteDesk-$VERSION-使用说明书.pdf"
 if [ -f "$MANUAL_PDF" ]; then
@@ -102,6 +114,7 @@ RemoteDesk $VERSION
 
 直接用
   00  使用说明书.pdf                                          ★ 先看这个（可打印）
+  00a docs/手机端Tailscale设置.pdf                           手机用流量连电脑时先看这个
   01  installers/RemoteDesk-$VERSION-macos-universal.dmg      macOS 13+（Intel / Apple Silicon）
   02  installers/RemoteDesk-$VERSION-android-arm64.apk        Android 7.0+，手机当主控
   03  installers/windows/START-HERE.md                        Windows：浏览器版免安装，或一键编译
@@ -146,6 +159,8 @@ for probe in \
   "RemoteDesk-$VERSION/CHANGELOG.md" \
   "RemoteDesk-$VERSION/README-FIRST.txt" \
   "RemoteDesk-$VERSION/docs/使用说明书.md" \
+  "RemoteDesk-$VERSION/docs/手机端Tailscale设置.md" \
+  "RemoteDesk-$VERSION/docs/手机端Tailscale设置.pdf" \
   "RemoteDesk-$VERSION/使用说明书.pdf" \
   "RemoteDesk-$VERSION/installers/RemoteDesk-$VERSION-macos-universal.dmg" \
   "RemoteDesk-$VERSION/installers/RemoteDesk-$VERSION-android-arm64.apk" \

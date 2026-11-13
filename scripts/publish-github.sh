@@ -84,13 +84,21 @@ git push -u origin HEAD
 # "RemoteDesk-<版本>-使用说明书.pdf" 上传后中文会被洗掉，只剩一串连字符。
 # 所以上传前复制一份英文名的副本，原文件留着（打包进 zip 时仍用中文名）。
 MANUAL_UP="dist/RemoteDesk-$VERSION-manual-zh.pdf"
+GUIDE_UP="dist/RemoteDesk-$VERSION-tailscale-android.pdf"
 if [ -f "dist/RemoteDesk-$VERSION-使用说明书.pdf" ]; then
   cp -f "dist/RemoteDesk-$VERSION-使用说明书.pdf" "$MANUAL_UP"
+fi
+# 手机端 Tailscale 设置说明：中文名同样会被 GitHub 洗掉，上传前复制英文名副本。
+if [ -f "dist/手机端Tailscale设置.pdf" ]; then
+  cp -f "dist/手机端Tailscale设置.pdf" "$GUIDE_UP"
+else
+  echo "  [!] 没有 dist/手机端Tailscale设置.pdf，先跑 scripts/build-tailscale-guide.py" >&2
 fi
 
 ASSETS=()
 for f in \
   "$MANUAL_UP" \
+  "$GUIDE_UP" \
   "dist/RemoteDesk-$VERSION-macos-universal.dmg" \
   "dist/RemoteDesk-$VERSION-android-arm64.apk" \
   "dist/RemoteDesk-$VERSION-full.zip"; do
@@ -108,6 +116,7 @@ cat > "$NOTES" <<TXT
 | 平台 | 文件 |
 |---|---|
 | 说明书 | \`RemoteDesk-$VERSION-manual-zh.pdf\`（可打印，**建议先看**） |
+| 手机外网连接 | \`RemoteDesk-$VERSION-tailscale-android.pdf\`（Tailscale 逐屏设置，可打印） |
 | macOS 13+ | \`RemoteDesk-$VERSION-macos-universal.dmg\`（Intel + Apple Silicon 通用） |
 | Android 7.0+ | \`RemoteDesk-$VERSION-android-arm64.apk\`（手机只能当主控） |
 | Windows | 无预编译包，见下方说明 |

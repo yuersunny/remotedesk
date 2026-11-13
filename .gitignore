@@ -61,3 +61,9 @@ dist/RemoteDesk-*-manual-zh.pdf
 
 # 隐私黑名单：里面是要藏的值，只留在本机
 .privacy-blocklist
+
+# 手机端 Tailscale 设置说明的排版产物：由 scripts/build-tailscale-guide.py 生成，
+# 随 Release 分发，不进版本库（同使用说明书 PDF）。
+dist/手机端Tailscale设置.html
+dist/手机端Tailscale设置.pdf
+dist/RemoteDesk-*-tailscale-android.pdf
