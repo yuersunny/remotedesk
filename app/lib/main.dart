@@ -1157,6 +1157,10 @@ class _HomePageState extends State<HomePage> implements MobileHost {
   /// 发现源消失就把采集换到新输出上（`replaceTrack`，不重新协商），画面几秒
   /// 内自己回来，不用断开重连。检查间隔 5 秒：枚举一次要过插件拿缩略图，
   /// 太频繁会让被控端白白耗电，而换显示器这种事本来也不差这几秒。
+  ///
+  /// 同一个 5 秒循环顺带做另一件事：重新读桌面几何并重发 `hello`。显示器
+  /// 休眠唤醒、外接屏插拔、DPI 变化都会改变控制端用来算 contain 矩形的画面
+  /// 尺寸；握手时上报一次是不够的，表现就是"隔一会儿回来，鼠标点不准"。
   void _startSourceWatch() {
     _sourceWatchTimer?.cancel();
     _sourceWatchTimer =
@@ -1164,6 +1168,9 @@ class _HomePageState extends State<HomePage> implements MobileHost {
       // Watch while *any* caller is being served; the capture is shared, so one
       // broken display breaks every viewer at once.
       if (_hosted.isEmpty || !mounted) return;
+      // Geometry applies on every platform, including those with no source id
+      // (macOS reports none). Do it before any early return below.
+      await _refreshGeometry();
       if (_recovering) return;
       final current = _request.sourceId;
       if (current == null) return;
@@ -1178,6 +1185,27 @@ class _HomePageState extends State<HomePage> implements MobileHost {
         _recovering = false;
       }
     });
+  }
+
+  /// 被控端：把"此刻的桌面尺寸"重新告诉每一个控制端。
+  ///
+  /// `_injector.support` 在权限就绪后就不再轮询，一直是启动时的快照；而
+  /// 原生注入器每次点击都按**实时**虚拟桌面换算归一化坐标。两边一旦漂移，
+  /// 画面矩形与落点基准就对不上。`sendHello` 内部去重，几何没变时这里
+  /// 既不发帧也不写日志。
+  Future<void> _refreshGeometry() async {
+    final support = await _injector.refreshGeometry();
+    if (!mounted || _hosted.isEmpty) return;
+    final screen = support.screenWidth > 0
+        ? Size(
+            support.screenWidth.toDouble(),
+            support.screenHeight.toDouble(),
+          )
+        : null;
+    for (final session in _hosted.values.toList(growable: false)) {
+      session.updateScreen(screen);
+      await session.sendHello();
+    }
   }
 
   /// 把采集切到 [next]，全程不动会话。
@@ -1222,6 +1250,13 @@ class _HomePageState extends State<HomePage> implements MobileHost {
     _log(swapped > 0
         ? '画面已恢复（采集源 ${next.name}）· $swapped 路会话已切换'
         : '采集已重建，等会话挂轨后生效');
+
+    // 新输出的分辨率常常和旧的不同。控制端按画面尺寸算 contain 矩形，
+    // 不重报就会沿用旧比例归一化点击 —— 正是"点哪儿都偏一点"的来源。
+    // force 是必要的：轨道换了，即使数字凑巧相同也该让对端重新对一次位。
+    for (final session in _hosted.values.toList(growable: false)) {
+      await session.sendHello(force: true);
+    }
   }
 
   /// 关掉**某一路**会话（被控端按对端 id；主控端就是唯一那一路）。

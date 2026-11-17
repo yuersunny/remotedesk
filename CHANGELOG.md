@@ -4,6 +4,34 @@
 
 ## 未发布
 
+**修：窗口/手机放着不用，回来后点不动、或鼠标点不准**
+
+现场报告两个症状，都是"会话建立时拍一次快照，之后就再也不更新"造成的：
+
+1. **点不准（几何漂移）**：`sendHello()` 只在数据通道打开时调用一次（源码
+   注释自己写着 "nothing calls it a second time today"），而 `HelloEvent`
+   的契约却承诺几何变化时重发。显示器休眠唤醒、外接屏插拔、DPI 变化、
+   `_recoverCapture` 重建采集源，都会改变画面尺寸；控制端仍按旧尺寸算
+   contain 矩形，归一化坐标自然整体偏移。另外 `_injector.support` 在权限
+   就绪后停止轮询，一直是启动时的快照，而原生注入器每次点击都按**实时**
+   虚拟桌面换算 —— 两边基准漂移。
+   现在：被控端复用 5 秒采集源看门狗重读 native 桌面尺寸与轨道 settings，
+   变化即对每个会话重发 `hello`；换源后强制重发；控制端改用 `getStats()`
+   每秒上报的解码帧尺寸优先算 picture（旧的 `renderer.value` 在部分后端
+   `replaceTrack` 后不刷新）。新增 `session_health.dart` 的纯函数，几何比较
+   去重保证稳定会话不发帧、不刷日志。
+2. **回来没反应（链路假死）**：WebRTC 把停摆的链路标成 `disconnected` 后
+   可能永远停在那里，不再回调 `failed`；而输入被 `phase == live` 门控，
+   画面停在最后一帧，`ready` 又只看 `remoteStream != null`（永不回退）——
+   用户对着冻结画面点，什么都不会发生也没有任何提示。
+   现在：`DisconnectWatch` 给断连 12 秒宽限期，超时判 `failed`；两端会话页
+   在"曾有画面但现在不是 live"时盖一层明确的中断卡片和「断开，重新连一次」
+   出口；回到前台补发一次后台时发出的 key-up / button-up（通道当时若已断
+   就丢了，远端可能仍按着键）。
+
+新增 `app/test/session_health_test.dart`（17 条）。`flutter analyze lib test`
+无告警，`flutter test` 189 passed。说明书第 9 章补两条症状。
+
 **补：手机端说明加「管理后台核对」一节**
 
 现场拿着 Tailscale 管理后台截图来问「设备都在列表里，为什么外网还连不上」——

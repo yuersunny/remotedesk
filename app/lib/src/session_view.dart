@@ -8,6 +8,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 // keeps the two unambiguous at every call site.
 import 'input_event.dart' as proto;
 import 'rtc_session.dart';
+import 'session_health.dart';
 
 
 /// The "in a session" screen: remote screen for the controller, a local
@@ -124,13 +125,26 @@ class _SessionViewState extends State<SessionView>
     WidgetsBinding.instance.addObserver(this);
   }
 
+  /// Releases issued when the window went away. If the link had already died
+  /// they never arrived, so the remote machine can still be holding a modifier
+  /// or a mouse button when we come back — which reads as "nothing responds".
+  /// They are all key-up / button-up, so sending them twice is harmless.
+  final List<proto.InputEvent> _staleReleases = <proto.InputEvent>[];
+
   /// Release everything the remote machine thinks is held when this window
   /// stops being the active one. Without it a window switch mid-keystroke
   /// leaves a modifier stuck down remotely, and every later key arrives as
   /// Ctrl+X.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state != AppLifecycleState.resumed) _releaseAll();
+    if (state == AppLifecycleState.resumed) {
+      for (final event in _staleReleases) {
+        widget.session.input.send(event);
+      }
+      _staleReleases.clear();
+    } else {
+      _releaseAll();
+    }
   }
 
   @override
@@ -146,19 +160,26 @@ class _SessionViewState extends State<SessionView>
 
   void _releaseAll() {
     final channel = widget.session.input;
+    // Only the most recent backgrounding matters; keeping every historical
+    // release would grow the list and replay stale clicks at old coordinates.
+    _staleReleases.clear();
     for (final key in _pressedKeys) {
-      channel.send(proto.KeyEvent(key: key, pressed: false));
+      final event = proto.KeyEvent(key: key, pressed: false);
+      channel.send(event);
+      _staleReleases.add(event);
     }
     _pressedKeys.clear();
 
     for (final button in _pressedButtons) {
       final position = _lastNormalised ?? const Offset(0.5, 0.5);
-      channel.send(proto.PointerButtonEvent(
+      final event = proto.PointerButtonEvent(
         button: button,
         pressed: false,
         x: position.dx,
         y: position.dy,
-      ));
+      );
+      channel.send(event);
+      _staleReleases.add(event);
     }
     _pressedButtons.clear();
   }
@@ -317,18 +338,84 @@ class _SessionViewState extends State<SessionView>
     );
   }
 
-  /// Picture aspect ratio, preferring the decoded frame over what the target
-  /// reported. Null while both are still unknown.
+  /// Picture aspect ratio. Null while no source has a usable size.
+  ///
+  /// `getStats()` reports the decoded frame every second and is the only value
+  /// that reliably follows a resolution change. `renderer.value` is a snapshot
+  /// that some backends never refresh after `replaceTrack`, and `hello` is
+  /// older still. Using the wrong one makes the contain-rectangle — and thus
+  /// every normalised click — drift after the machine has been left idle.
   Size? _remotePictureSize() {
     final value = widget.session.remoteRenderer.value;
-    if (value.width > 0 && value.height > 0) {
-      return Size(value.width, value.height);
-    }
     final hello = widget.remoteHello;
-    if (hello != null && hello.videoWidth > 0 && hello.videoHeight > 0) {
-      return Size(hello.videoWidth.toDouble(), hello.videoHeight.toDouble());
-    }
-    return null;
+    final stats = widget.stats;
+    return remotePictureSize(
+      rendererWidth: value.width,
+      rendererHeight: value.height,
+      statsWidth: stats.width,
+      statsHeight: stats.height,
+      helloWidth: hello?.videoWidth,
+      helloHeight: hello?.videoHeight,
+    );
+  }
+
+  /// We once had frames, but the link is no longer live. The last decoded frame
+  /// stays on screen and input is gated on `live`, so without this the user
+  /// taps a frozen picture with no idea why nothing happens.
+  bool get _interrupted =>
+      widget.session.remoteStream != null &&
+      (widget.phase == SessionPhase.connecting ||
+          widget.phase == SessionPhase.failed ||
+          widget.phase == SessionPhase.closed);
+
+  Widget _interruptedOverlay() {
+    final dead = widget.phase == SessionPhase.failed ||
+        widget.phase == SessionPhase.closed;
+    return Positioned.fill(
+      child: Container(
+        color: const Color(0xCC070A0F),
+        alignment: Alignment.center,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 380),
+          child: Card(
+            color: const Color(0xFF161C27),
+            child: Padding(
+              padding: const EdgeInsets.all(22),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    dead ? Icons.link_off : Icons.sync,
+                    color: dead ? const Color(0xFFFF6B6B) : const Color(0xFFFBBF24),
+                    size: 30,
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    dead ? '连接已中断' : '正在恢复连接…',
+                    style: const TextStyle(
+                        color: Colors.white, fontSize: 17, fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    dead
+                        ? '长时间没操作后链路断开了，画面停在了最后一帧。这时候点它是没有反应的，断开后重新连一次就好。'
+                        : '链路暂时断了，稍等几秒。一直没恢复的话，断开重新连一次。',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.white54, fontSize: 13, height: 1.5),
+                  ),
+                  const SizedBox(height: 18),
+                  FilledButton.icon(
+                    onPressed: widget.onHangUp,
+                    icon: const Icon(Icons.refresh, size: 17),
+                    label: const Text('断开，重新连一次'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   Widget _remoteArea(ThemeData theme) {
@@ -429,6 +516,7 @@ class _SessionViewState extends State<SessionView>
                     // between. See CaptureRequest.showCursor: the sharer's own
                     // cursor is explicitly excluded on every platform, which is
                     // what keeps this the *only* arrow on screen.
+                    if (_interrupted) _interruptedOverlay(),
                     if (_canControl)
                       Positioned.fill(
                         child: IgnorePointer(

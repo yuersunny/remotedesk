@@ -135,6 +135,44 @@ class InputInjector {
     return _support;
   }
 
+  /// Re-read just the virtual-desktop size from the native side.
+  ///
+  /// [init]'s idle watcher stops polling as soon as injection is available, so
+  /// `support` otherwise stays at its startup snapshot forever. A monitor
+  /// waking from sleep, an external display being plugged in, or a DPI change
+  /// all alter the geometry the injector maps normalised clicks onto; the
+  /// target uses the fresh numbers to re-announce `hello` to its controllers.
+  ///
+  /// Deliberately does not touch permissions, re-run the self-test, or start
+  /// another watcher — this is called every few seconds for the whole session.
+  Future<InjectionSupport> refreshGeometry() async {
+    if (kIsWeb || !_ready) return _support;
+    try {
+      final info = await _channel.invokeMapMethod<String, Object?>('screenInfo');
+      if (info == null) return _support;
+      final width = (info['width'] as num?)?.toInt() ?? 0;
+      final height = (info['height'] as num?)?.toInt() ?? 0;
+      if (width <= 0 || height <= 0) return _support;
+      if (width == _support.screenWidth && height == _support.screenHeight) {
+        return _support;
+      }
+      final before = '${_support.screenWidth}×${_support.screenHeight}';
+      _support = InjectionSupport(
+        available: _support.available,
+        reason: _support.reason,
+        screenWidth: width,
+        screenHeight: height,
+      );
+      // Only on change: this runs on a timer and a repeating line would bury
+      // every other diagnostic in the log.
+      onLog?.call('桌面尺寸变了：$before → $width×$height，已通知控制端重新对位');
+      onChanged?.call();
+    } catch (_) {
+      // A platform without the method keeps the last known geometry.
+    }
+    return _support;
+  }
+
   /// Ask for whatever permission the platform requires to post events, then
   /// re-probe.
   ///

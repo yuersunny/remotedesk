@@ -7,6 +7,7 @@ import 'input_channel.dart';
 import 'input_event.dart';
 import 'platform_kind.dart';
 import 'signaling_client.dart';
+import 'session_health.dart';
 
 /// Who we are in a session.
 enum SessionRole {
@@ -91,10 +92,12 @@ class RtcSession {
     required this.signaling,
     required this.peerId,
     this.iceServers = const <Map<String, dynamic>>[],
-    this.targetScreen,
+    Size? targetScreen,
     this.onLog,
     this.onPhase,
-  });
+  }) {
+    _targetScreen = targetScreen;
+  }
 
   final SessionRole role;
   final SignalingClient signaling;
@@ -104,7 +107,14 @@ class RtcSession {
   /// Target side only: physical size of the screen being shared. Reported to
   /// the controller in the input `hello` so its HUD can show the real desktop
   /// resolution instead of the (possibly downscaled) video size.
-  final Size? targetScreen;
+  ///
+  /// Mutable because a desktop does not keep its geometry for the lifetime of
+  /// a session: a monitor waking from sleep, an external display being plugged
+  /// in, or a DPI change all move the virtual desktop. The owner re-reads the
+  /// native size every few seconds and calls [updateScreen].
+  Size? _targetScreen;
+  Size? get targetScreen => _targetScreen;
+  void updateScreen(Size? size) => _targetScreen = size;
 
   final void Function(String message)? onLog;
   final void Function(SessionPhase phase)? onPhase;
@@ -130,6 +140,17 @@ class RtcSession {
   int _lastBytes = 0;
   DateTime _lastStatsAt = DateTime.now();
   SessionStats _stats = SessionStats.empty;
+
+  /// Last geometry actually put on the wire. Polling calls [sendHello] every
+  /// few seconds; without this the log and the control channel would fill up
+  /// with identical handshakes.
+  HelloEvent? _lastHello;
+
+  /// A `disconnected` peer connection can stay there forever. This is the
+  /// deadline that turns "frozen picture swallowing clicks" into an honest
+  /// "connection failed, reconnect".
+  final DisconnectWatch _link = DisconnectWatch();
+  Timer? _linkTimer;
 
   SessionStats get stats => _stats;
   MediaStream? get remoteStream => _remoteStream;
@@ -196,14 +217,28 @@ class RtcSession {
       _log('连接状态: ${state.name}');
       switch (state) {
         case RTCPeerConnectionState.RTCPeerConnectionStateConnected:
+          _link.connected();
+          _linkTimer?.cancel();
+          _linkTimer = null;
           _setPhase(SessionPhase.live);
         case RTCPeerConnectionState.RTCPeerConnectionStateConnecting:
           _setPhase(SessionPhase.connecting);
         case RTCPeerConnectionState.RTCPeerConnectionStateDisconnected:
+          // ICE may recover on its own, so do not tear anything down yet — but
+          // do start a deadline. Staying in `connecting` forever is worse than
+          // reporting a failure: input is gated on `live`, so the user just
+          // sees the last frame and taps it with no effect.
+          _link.disconnected(DateTime.now());
           _setPhase(SessionPhase.connecting);
+          _armLinkTimeout();
         case RTCPeerConnectionState.RTCPeerConnectionStateFailed:
+          _linkTimer?.cancel();
+          _linkTimer = null;
+          _link.reset();
           _setPhase(SessionPhase.failed);
         case RTCPeerConnectionState.RTCPeerConnectionStateClosed:
+          _linkTimer?.cancel();
+          _linkTimer = null;
           _setPhase(SessionPhase.closed);
         case RTCPeerConnectionState.RTCPeerConnectionStateNew:
           break;
@@ -277,13 +312,28 @@ class RtcSession {
     }
   }
 
+  void _armLinkTimeout() {
+    _linkTimer?.cancel();
+    _linkTimer = Timer(_link.grace, () {
+      if (_disposed || !_link.expired(DateTime.now())) return;
+      if (_phase == SessionPhase.live || _phase == SessionPhase.closed) return;
+      _log('连接中断超过 ${_link.grace.inSeconds} 秒没能自己恢复 —— 请断开后重新连一次');
+      _setPhase(SessionPhase.failed);
+    });
+  }
+
   /// Target side: report desktop geometry to the controller.
   ///
-  /// Public so a future geometry change (resolution switch, DPI change) can
-  /// re-announce itself; nothing calls it a second time today. Frame size comes
-  /// from the live track when available, because the encoder may hand back a
-  /// smaller picture than requested.
-  Future<void> sendHello() async {
+  /// Called on the initial handshake **and** whenever the geometry changes:
+  /// the owner polls the native virtual-desktop size and the captured track's
+  /// settings. The controller uses the reported frame size to fit the picture,
+  /// so a stale `hello` after a resolution change makes every click land off
+  /// target. [force] is for capture-source recovery, where the picture may
+  /// have changed even if the numbers happen to match.
+  ///
+  /// Frame size comes from the live track when available, because the encoder
+  /// may hand back a smaller picture than requested.
+  Future<void> sendHello({bool force = false}) async {
     final screen = targetScreen;
     var videoWidth = 0;
     var videoHeight = 0;
@@ -308,13 +358,26 @@ class RtcSession {
     final screenWidth = screen?.width.round() ?? videoWidth;
     final screenHeight = screen?.height.round() ?? videoHeight;
 
-    input.send(HelloEvent(
+    if (!force && !geometryChanged(_lastHello,
+        screenWidth: screenWidth,
+        screenHeight: screenHeight,
+        videoWidth: videoWidth,
+        videoHeight: videoHeight)) {
+      return;
+    }
+    // Do not mark it as sent until the channel is actually there; otherwise a
+    // handshake lost during reconnect would never be retried by the poller.
+    if (!input.isOpen) return;
+
+    final hello = HelloEvent(
       screenWidth: screenWidth,
       screenHeight: screenHeight,
       videoWidth: videoWidth,
       videoHeight: videoHeight,
       platform: platformTag,
-    ));
+    );
+    _lastHello = hello;
+    input.send(hello);
     _log('已上报桌面尺寸 $screenWidth×$screenHeight'
         '（画面 $videoWidth×$videoHeight）');
   }
@@ -636,6 +699,8 @@ class RtcSession {
   Future<void> close({bool stopLocalStream = true}) async {
     if (_disposed) return;
     _disposed = true;
+    _linkTimer?.cancel();
+    _linkTimer = null;
     _setPhase(SessionPhase.closed);
     try {
       await _pc?.close();

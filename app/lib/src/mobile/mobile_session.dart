@@ -7,6 +7,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../input_event.dart' as proto;
 import '../rtc_session.dart';
+import '../session_health.dart';
 import 'hid_text.dart';
 import 'touch_input.dart';
 
@@ -102,11 +103,24 @@ class _MobileSessionViewState extends State<MobileSessionView>
     _touch.enabled = _canControl;
   }
 
+  /// Releases sent while backgrounding. A link that died while the app was
+  /// frozen never delivered them, so replay once on return — all of these are
+  /// key-up / button-up, which are idempotent.
+  final List<proto.InputEvent> _staleReleases = <proto.InputEvent>[];
+  bool _releasing = false;
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     // Backgrounding the app must not leave a modifier held down on the remote
     // machine; every later key would arrive as Ctrl+X.
-    if (state != AppLifecycleState.resumed) _releaseAll();
+    if (state == AppLifecycleState.resumed) {
+      for (final event in _staleReleases) {
+        widget.session.input.send(event);
+      }
+      _staleReleases.clear();
+    } else {
+      _releaseAll();
+    }
   }
 
   @override
@@ -121,12 +135,19 @@ class _MobileSessionViewState extends State<MobileSessionView>
   }
 
   void _releaseAll() {
+    _staleReleases.clear();
+    // _touch.reset() sends a button-up only while a drag is in progress; the
+    // flag lets _sendButton capture it at its real coordinates.
+    _releasing = true;
+    _touch.reset();
+    _releasing = false;
     for (final key in _down.toList(growable: false)) {
-      widget.session.input.send(proto.KeyEvent(key: key, pressed: false));
+      final event = proto.KeyEvent(key: key, pressed: false);
+      widget.session.input.send(event);
+      _staleReleases.add(event);
     }
     _down.clear();
     _latched.clear();
-    _touch.reset();
   }
 
   void _pulse(Offset local) {
@@ -140,12 +161,14 @@ class _MobileSessionViewState extends State<MobileSessionView>
       widget.session.input.send(proto.PointerMove(normalised.dx, normalised.dy));
 
   void _sendButton(int button, bool pressed, Offset normalised) {
-    widget.session.input.send(proto.PointerButtonEvent(
+    final event = proto.PointerButtonEvent(
       button: button,
       pressed: pressed,
       x: normalised.dx,
       y: normalised.dy,
-    ));
+    );
+    widget.session.input.send(event);
+    if (_releasing && !pressed) _staleReleases.add(event);
   }
 
   void _sendWheel(double dx, double dy) {
@@ -237,14 +260,66 @@ class _MobileSessionViewState extends State<MobileSessionView>
 
   Size? _pictureSize() {
     final value = widget.session.remoteRenderer.value;
-    if (value.width > 0 && value.height > 0) {
-      return Size(value.width, value.height);
-    }
     final hello = widget.remoteHello;
-    if (hello != null && hello.videoWidth > 0 && hello.videoHeight > 0) {
-      return Size(hello.videoWidth.toDouble(), hello.videoHeight.toDouble());
-    }
-    return null;
+    final stats = widget.stats;
+    return remotePictureSize(
+      rendererWidth: value.width,
+      rendererHeight: value.height,
+      statsWidth: stats.width,
+      statsHeight: stats.height,
+      helloWidth: hello?.videoWidth,
+      helloHeight: hello?.videoHeight,
+    );
+  }
+
+  /// We had frames, but the link is not live. Without this the phone shows a
+  /// frozen last frame while every tap is silently discarded.
+  bool get _interrupted =>
+      widget.session.remoteStream != null &&
+      (widget.phase == SessionPhase.connecting ||
+          widget.phase == SessionPhase.failed ||
+          widget.phase == SessionPhase.closed);
+
+  Widget _interruptedOverlay() {
+    final dead = widget.phase == SessionPhase.failed ||
+        widget.phase == SessionPhase.closed;
+    return Positioned.fill(
+      child: Container(
+        color: const Color(0xCC070A0F),
+        alignment: Alignment.center,
+        padding: const EdgeInsets.symmetric(horizontal: 28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              dead ? Icons.link_off : Icons.sync,
+              color: dead ? const Color(0xFFFF6B6B) : const Color(0xFFFBBF24),
+              size: 36,
+            ),
+            const SizedBox(height: 14),
+            Text(
+              dead ? '连接已中断' : '正在恢复连接…',
+              style: const TextStyle(
+                  color: Colors.white, fontSize: 18, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              dead
+                  ? '长时间没操作后链路断开了，画面停在了最后一帧。这时候点它是没有反应的，回去重新连一次就好。'
+                  : '链路暂时断了，稍等几秒。一直没恢复的话，回去重新连一次。',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white54, fontSize: 13, height: 1.6),
+            ),
+            const SizedBox(height: 22),
+            FilledButton.icon(
+              onPressed: _confirmHangUp,
+              icon: const Icon(Icons.refresh, size: 17),
+              label: const Text('断开，重新连一次'),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -447,6 +522,7 @@ class _MobileSessionViewState extends State<MobileSessionView>
               if (!ready) _waiting(),
               if (ready && _viewport.isZoomed)
                 Positioned(right: 14, bottom: 14, child: _resetButton()),
+              if (_interrupted) _interruptedOverlay(),
               IgnorePointer(child: _ripple()),
             ],
           ),
