@@ -95,6 +95,7 @@ for probe in \
   "windows-kit/src/remotedesk/app/windows/runner/input_injector.cpp" \
   "windows-kit/src/remotedesk/app/lib/src/input_injector.dart" \
   "windows-kit/tools/build-windows.ps1" \
+  "windows-kit/06-run-as-admin.cmd" \
   "windows-kit/web-preview/index.html"; do
   # 用 -Z1 精确列出条目名：只 -l 会匹配到子串，缺文件也能"通过"
   if [ -n "$(unzip -Z1 "$ZIP" "$probe" 2>/dev/null)" ]; then

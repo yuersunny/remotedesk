@@ -2272,6 +2272,28 @@ class _HomePageState extends State<HomePage> implements MobileHost {
             // from outside. It decides what the user should do next, so it
             // cannot live at the bottom of an advanced panel.
             _reachRow(theme),
+            // Only the native Windows build can be a controlled host with
+            // elevated windows in play; the web build is controller-only and
+            // macOS/Android have no UIPI. Keep it to one quiet line so the
+            // host card stays simple.
+            if (!kIsWeb && defaultTargetPlatform == TargetPlatform.windows) ...[
+              const SizedBox(height: 8),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.info_outline,
+                      size: 14, color: theme.colorScheme.outline),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '要操作任务管理器等管理员窗口，请把本机 RemoteDesk 以管理员身份运行（用 06-run-as-admin.cmd），再把窗口最小化。',
+                      style: theme.textTheme.bodySmall
+                          ?.copyWith(color: theme.colorScheme.outline, height: 1.4),
+                    ),
+                  ),
+                ],
+              ),
+            ],
             const SizedBox(height: 10),
             Row(
               crossAxisAlignment: CrossAxisAlignment.center,

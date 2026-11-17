@@ -136,7 +136,7 @@ cat > "$NOTES" <<TXT
 
 ## 这一版（${VERSION}）
 
-1.0.8 之后提交的四组改动，这一版**第一次进安装包**（此前只在源码里）：
+1.0.8 之后提交的改动，这一版**第一次进安装包**（此前只在源码里）；最后一条是同一版本号的资产增补：
 
 - **放着一段时间回来点不动、或鼠标点不准**：显示器休眠唤醒、外接屏插拔、DPI
   变化会改掉被控端的画面尺寸，控制端却仍按旧尺寸换算坐标；WebRTC 把停摆链路
@@ -151,6 +151,11 @@ cat > "$NOTES" <<TXT
   自检、/health 验通路、Windows 防火墙，以及管理后台绿点 / 灰点各代表什么。
 - 1.0.8 的多台设备同时连、被控端「能不能从外面连」状态条、手机端「还原」
   按钮都继续保留。
+- **Windows 被控端补了管理员启动入口**：`06-run-as-admin.cmd`（全量包
+  `installers/windows/` 内）。任务管理器这类自动提权的窗口，普通权限的 RemoteDesk
+  发的输入会被 UIPI 静默丢弃，表现是「看得到、点不动、也关不掉」；用这个脚本
+  启动、在 UAC 点「是」并把窗口最小化后重连即可。说明书与套件 START-HERE 里
+  原来「任何远程软件都一样」的说法已纠正：商业软件靠提权后台服务，绿色版靠提权运行。
 
 通信协议没有改动，旧版仍能连上；但**中断提示、几何自动修正、失败后可停止换机**
 这些新行为，要两端都更新到 ${VERSION} 才有。
@@ -159,7 +164,8 @@ cat > "$NOTES" <<TXT
 TXT
 
 if gh release view "$TAG" >/dev/null 2>&1; then
-  echo "==> Release $TAG 已存在，补传产物"
+  echo "==> Release $TAG 已存在，更新说明并覆盖资产"
+  gh release edit "$TAG" --notes-file "$NOTES" >/dev/null
   gh release upload "$TAG" "${ASSETS[@]}" --clobber
 else
   echo "==> 创建 Release $TAG"

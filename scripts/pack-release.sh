@@ -22,7 +22,7 @@ ZIP="$ROOT/dist/RemoteDesk-$VERSION-full.zip"
 for f in "$DMG" "$APK"; do
   [ -f "$f" ] || { echo "[x] 缺产物：$f" >&2; echo "    先跑 pack-macos-dmg.sh / build-android.sh" >&2; exit 1; }
 done
-for f in "$KIT/START-HERE.md" "$KIT/04-build-windows.cmd"; do
+for f in "$KIT/START-HERE.md" "$KIT/04-build-windows.cmd" "$KIT/06-run-as-admin.cmd"; do
   [ -f "$f" ] || { echo "[x] Windows 套件不完整：缺 $f" >&2; exit 1; }
 done
 
@@ -124,6 +124,7 @@ RemoteDesk $VERSION
   01  installers/RemoteDesk-$VERSION-macos-universal.dmg      macOS 13+（Intel / Apple Silicon）
   02  installers/RemoteDesk-$VERSION-android-arm64.apk        Android 7.0+，手机当主控
   03  installers/windows/START-HERE.md                        Windows：浏览器版免安装，或一键编译
+  03a installers/windows/06-run-as-admin.cmd                 Win 被控端：以管理员启动（才能操作任务管理器）
 
   装完先看 使用说明书.pdf。macOS 必须手动给「屏幕录制」和「辅助功能」两个权限，
   不给的话要么黑屏、要么画面正常但点不动。
@@ -173,6 +174,7 @@ for probe in \
   "RemoteDesk-$VERSION/installers/windows/START-HERE.md" \
   "RemoteDesk-$VERSION/installers/windows/00-RUN-WEB-NOW.cmd" \
   "RemoteDesk-$VERSION/installers/windows/04-build-windows.cmd" \
+  "RemoteDesk-$VERSION/installers/windows/06-run-as-admin.cmd" \
   "RemoteDesk-$VERSION/installers/windows/tools/build-windows.ps1" \
   "RemoteDesk-$VERSION/installers/windows/web-preview/index.html" \
   "RemoteDesk-$VERSION/source/app/pubspec.yaml" \

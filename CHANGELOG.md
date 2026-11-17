@@ -73,6 +73,25 @@ VPN 授权弹窗该点哪个、没有 Google Play 时从哪下包。新增
 新增 `classifyAddress()`（单个地址分类，给拨号方用；`classifyReach()` 是给被控方用的）。
 说明书 4.4 / 4.8 / 6.2 / 第 9 章同步；`flutter analyze lib test` 无告警，`flutter test` 171 passed。
 
+**补：Windows 被控端加管理员启动入口，纠正 UIPI 说法（同一版本资产增补）**
+
+现场报告「Win 被控时打开任务管理器，Mac 端点 X / Alt+F4 都关不掉」。核查
+`app/windows/runner/runner.exe.manifest` 无提权声明、`SendInput` 被 UIPI 静默丢弃；
+键位映射（`F4 → VK_F4`、`AltLeft → VK_LMENU`）本来就是对的，问题在注入层。
+说明书原来写「系统限制，任何远程软件都一样」并不准确——商业远程软件靠提权后台服务
+绕开，RemoteDesk 作为绿色版只需自己以管理员运行即可，但套件里**只有普通启动脚本**，
+等于知道原因也找不到按钮。
+
+- 新增 `dist/windows-kit/06-run-as-admin.cmd`：UAC 提权启动编译出的 exe，
+  无 BOM + CRLF + 纯 ASCII，复用 05 脚本的两处源码定位。
+- 说明书 2 章表格、3.2 / 3.4、第 9 章与套件 START-HERE 同步；被控端界面在
+  Windows 原生版加一行低调提示，别再让人对着没反应的窗口猜。
+- 打包自检清单加 `06-run-as-admin.cmd`，确保不发漏。
+
+把「注入失败回报到控制端」要动协议与 Windows C++，仍待在 Windows 上重编验证，本次未做。
+同一 1.0.9 版本号覆盖 Release 的说明书 PDF 与 full.zip；macOS DMG / Android APK
+不受影响（该提示只在 Windows 原生版渲染），不重出以免同版本号字节漂移。
+
 ## 1.0.8 — 2026-11-12
 
 **新：一台被控机可以同时被多台设备连接**
