@@ -208,8 +208,18 @@ while IFS= read -r hit; do
   [ -z "$hit" ] && continue
   IDE_HITS="${IDE_HITS}${hit#"$CHK"/}"$'\n'
 done <<< "$(find "$CHK" \( -type d -name '.idea' -o -type f -name 'local.properties' \) 2>/dev/null | head -5 || true)"
+# 历史检查只看「本次还没推送的提交」。已经推到公开仓库的提交信息本来就查得到，
+# 包内 .git 只是同一份历史的拷贝，不会因为打包新增泄漏；若把整段 --all 历史都算
+# 进 FAIL，一条早年写进提交信息的旧串会永久卡住之后每一次发版（1.0.9 就撞上了
+# b72ff9b 的提交信息）。上面的正文扫描仍对包内所有文件全量生效，新写进去的内容
+# 一样会被拦下。远端那处既成泄漏要清理得改写历史，属于单独一件事，不在这里偷偷做。
 if [ -f "$BLOCK" ]; then
-  HIST_HITS="$(git -C "$CHK/RemoteDesk-$VERSION/source" log --all --format='%s%n%b' 2>/dev/null \
+  SRCGIT="$CHK/RemoteDesk-$VERSION/source"
+  RANGE=(--all)
+  if git -C "$SRCGIT" rev-parse --verify origin/main >/dev/null 2>&1; then
+    RANGE=(origin/main..HEAD)
+  fi
+  HIST_HITS="$(git -C "$SRCGIT" log "${RANGE[@]}" --format='%s%n%b' 2>/dev/null \
     | grep -cF -f "$BLOCK" || true)"
 else
   HIST_HITS=0
