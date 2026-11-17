@@ -115,10 +115,10 @@ cat > "$NOTES" <<TXT
 
 | 平台 | 文件 |
 |---|---|
-| 说明书 | \`RemoteDesk-$VERSION-manual-zh.pdf\`（可打印，**建议先看**） |
-| 手机外网连接 | \`RemoteDesk-$VERSION-tailscale-android.pdf\`（Tailscale 逐屏设置，可打印） |
-| macOS 13+ | \`RemoteDesk-$VERSION-macos-universal.dmg\`（Intel + Apple Silicon 通用） |
-| Android 7.0+ | \`RemoteDesk-$VERSION-android-arm64.apk\`（手机只能当主控） |
+| 说明书 | \`RemoteDesk-${VERSION}-manual-zh.pdf\`（可打印，**建议先看**） |
+| 手机外网连接 | \`RemoteDesk-${VERSION}-tailscale-android.pdf\`（Tailscale 逐屏设置，可打印） |
+| macOS 13+ | \`RemoteDesk-${VERSION}-macos-universal.dmg\`（Intel + Apple Silicon 通用） |
+| Android 7.0+ | \`RemoteDesk-${VERSION}-android-arm64.apk\`（手机只能当主控） |
 | Windows | 无预编译包，见下方说明 |
 
 装完先看说明书 PDF。macOS 必须手动给「屏幕录制」和「辅助功能」两个权限，
@@ -126,7 +126,7 @@ cat > "$NOTES" <<TXT
 
 ## 全量包
 
-\`RemoteDesk-$VERSION-full.zip\` = 三端产物 + 完整源码（含 git 历史）+ Windows 一键编译套件。
+\`RemoteDesk-${VERSION}-full.zip\` = 三端产物 + 完整源码（含 git 历史）+ Windows 一键编译套件。
 
 ## Windows 为什么没有 exe
 
@@ -134,7 +134,7 @@ cat > "$NOTES" <<TXT
 全量包的 \`installers/windows/\` 里有两条路：浏览器版免安装（只能当主控），
 或跑一次一键脚本编译原生版（约 20 分钟，装 VS Build Tools + Flutter）。
 
-## 这一版（$VERSION）
+## 这一版（${VERSION}）
 
 1.0.8 之后提交的四组改动，这一版**第一次进安装包**（此前只在源码里）：
 
@@ -153,7 +153,7 @@ cat > "$NOTES" <<TXT
   按钮都继续保留。
 
 通信协议没有改动，旧版仍能连上；但**中断提示、几何自动修正、失败后可停止换机**
-这些新行为，要两端都更新到 $VERSION 才有。
+这些新行为，要两端都更新到 ${VERSION} 才有。
 
 详见 [CHANGELOG.md](CHANGELOG.md)。
 TXT
