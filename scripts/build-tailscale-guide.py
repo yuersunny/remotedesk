@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 # 文件名带连字符（build-manual.py），不能 import build_manual，按路径加载。

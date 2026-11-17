@@ -133,7 +133,7 @@ env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy flutter test
 
 | 脚本 | 产物 |
 |---|---|
-| `./scripts/pack-macos-dmg.sh 1.0.8` | `dist/RemoteDesk-1.0.8-macos-universal.dmg`（通用二进制 + 签名） |
+| `./scripts/pack-macos-dmg.sh 1.0.9` | `dist/RemoteDesk-1.0.9-macos-universal.dmg`（通用二进制 + 签名） |
 | `./scripts/build-android.sh` | `dist/RemoteDesk-<版本>-android-arm64.apk` |
 | `./scripts/pack-windows-kit.sh m3.2` | Windows 机器用的套件（源码 + 一键编译脚本） |
 
