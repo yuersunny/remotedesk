@@ -27,8 +27,14 @@ for f in "$KIT/START-HERE.md" "$KIT/04-build-windows.cmd"; do
 done
 
 echo "==> 版本 $VERSION"
-echo "==> 清空 $OUT"
-rm -rf "$OUT"
+# 重跑时不清空上一轮的展开目录：那会一次删掉四百多个文件，删除保护必然拦下，
+# 而这些全是脚本自己生成的中间产物，没必要冒这个险。改成整体挪到系统临时目录
+# （一次 rename，不删任何文件），由系统回收；项目目录里始终只有当前这一份。
+if [ -d "$OUT" ]; then
+  STALE="$(mktemp -d "${TMPDIR:-/tmp}/remotedesk-pack.XXXXXX")"
+  mv "$OUT" "$STALE/"
+  echo "==> 上一轮展开目录移到 $STALE"
+fi
 mkdir -p "$OUT/installers"
 
 # ---- 1. 顶层文档 ------------------------------------------------------------
